@@ -1,0 +1,45 @@
+# Ozz — Local Testing Docker Compose
+# For testing the agent before HALctf submission
+
+version: "3.8"
+
+services:
+  ozz:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ozz:latest
+    container_name: ozz-agent
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TARGETS=${TARGETS:-10.0.0.1}
+      - MODEL_NAME=${MODEL_NAME:-Qwen/Qwen2.5-Coder-7B-Instruct}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.85}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+      - MAX_TOKENS=${MAX_TOKENS:-4096}
+      - TEMPERATURE=${TEMPERATURE:-0.3}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ${MODEL_DIR:-./models}:/models
+      - ./configs:/config
+      - /tmp/ozz:/tmp/ozz
+    ports:
+      - "8000:8000"  # vLLM API (for debugging)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    # For local testing with a target network
+    network_mode: host
+    # Or use a custom network:
+    # networks:
+    #   - ctf-net
+
+# networks:
+#   ctf-net:
+#     driver: bridge
