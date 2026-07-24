@@ -21,6 +21,8 @@ from typing import Optional
 # Adiciona o path do agente
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent.edge_cases import EDGE_CASE_SCENARIOS, get_edge_case_names, get_edge_case
+
 
 # === MOCK LLM: Segue um roteiro de pentest ===
 
@@ -83,6 +85,9 @@ MOCK_SCENARIOS = {
         {"thought": "Última flag — a mega flag!", "action": "submit_flag", "action_input": "flag{halctf_king_2026}"},
     ],
 }
+
+
+MOCK_SCENARIOS.update(EDGE_CASE_SCENARIOS)
 
 
 class MockLLM:
