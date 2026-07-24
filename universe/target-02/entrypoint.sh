@@ -3,7 +3,7 @@
 # Flag: flag{ssh_ghost} em /home/admin/flag.txt
 # Credencial extra: senha MySQL encontrada em /opt/config.ini
 
-set -e
+set +e  # Don't abort on errors (e.g. useradd already exists on restart)
 
 # Criar usuários com senhas fracas
 useradd -m -s /bin/bash admin
@@ -93,4 +93,5 @@ EOF
 chmod +x /opt/sysinfo.sh
 
 # Manter serviços rodando
-exec /usr/sbin/sshd && smbd --foreground --no-process-group
+/usr/sbin/sshd -D &
+smbd --foreground --no-process-group
