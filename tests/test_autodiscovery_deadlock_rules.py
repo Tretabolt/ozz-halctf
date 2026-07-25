@@ -17,7 +17,7 @@ class TestAutoDiscovery(unittest.TestCase):
         
         # Reseta o registro para testar a descoberta pura
         DomainSolverRegistry._solvers.clear()
-        self.assertFalse(DomainSolverRegistry.has_solver("pwn"))
+        self.assertNotIn("pwn", DomainSolverRegistry._solvers)
         
         # Executa auto-descoberta
         DomainSolverRegistry.discover_solvers()
