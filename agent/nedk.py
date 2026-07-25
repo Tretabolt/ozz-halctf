@@ -305,12 +305,57 @@ class NEDK:
         for target in targets:
             self.state.register_host(target)
 
+        # Subscribe NEDK to EventMesh CLASS_I perturbations (Recon/Ingestion Adapter)
+        self.events.subscribe("CLASS_I", self._handle_class_i_event)
+
         # Action history for loop detection
         self.action_history: list[dict] = []
         self.snapshots: list[dict] = []
         self.iteration_count = 0
 
         logger.info(f"🧠 NEDK initialized. Targets: {targets}")
+
+    def _handle_class_i_event(self, event_data: dict):
+        """
+        Handler para eventos CLASS_I (ReconAdapter / Ingestão).
+        Atualiza dinamicamente o Grafo G(t) e recalcula τ(t) no StateSpace S(t).
+        """
+        observations = []
+        if hasattr(event_data, "observations"):
+            observations = event_data.observations
+        elif isinstance(event_data, dict) and "observations" in event_data:
+            observations = event_data["observations"]
+
+        for obs in observations:
+            entity_key = getattr(obs, "entity_key", "") or obs.get("entity_key", "")
+            attrs = getattr(obs, "attributes", {}) or obs.get("attributes", {})
+            
+            host = attrs.get("host") or attrs.get("ip") or attrs.get("domain")
+            if not host or host == "target":
+                host = entity_key.split(":")[0] if ":" in entity_key and entity_key.split(":")[0] != "target" else ""
+            if not host:
+                host = self.targets[0] if self.targets else "unknown"
+
+            port = attrs.get("port")
+            service = attrs.get("service")
+
+            # Atualiza o G(t) no StateSpace
+            existing_host = self.state.graph.get(host, {"ports": [], "services": {}, "vulns": []})
+            ports = set(existing_host.get("ports", []))
+            services = existing_host.get("services", {})
+
+            if port:
+                ports.add(int(port))
+            if service and port:
+                services[str(port)] = service
+
+            self.state.register_host(
+                host=host,
+                ports=list(ports),
+                services=services,
+                vulns=existing_host.get("vulns", [])
+            )
+            logger.info(f"📡 NEDK S(t) atualizado via evento CLASS_I: host={host}, ports={list(ports)}")
 
     def run(self):
         """
