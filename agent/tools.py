@@ -150,6 +150,22 @@ class ToolRegistry:
             self._wget
         ))
 
+        # ExifTool (Forensics / Metadata)
+        self.register(Tool(
+            "exiftool",
+            "Read image and document metadata for hidden information.",
+            "exiftool file.jpg",
+            lambda args: self._shell(f"exiftool {args}")
+        ))
+
+        # Binwalk (Firmware / File extraction)
+        self.register(Tool(
+            "binwalk",
+            "Analyze and extract hidden files inside binary or image files.",
+            "binwalk -e firmware.bin",
+            lambda args: self._shell(f"binwalk {args}")
+        ))
+
         # Netcat
         self.register(Tool(
             "nc",

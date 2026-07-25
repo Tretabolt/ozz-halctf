@@ -250,6 +250,44 @@ What's your next action?"""
   "action_input": "sshpass -p 'password123' ssh -o StrictHostKeyChecking=no admin@10.0.0.20 'python3 -c \"import os; os.execl(chr(47)+chr(98)+chr(105)+chr(110)+chr(47)+chr(115)+chr(104), chr(115)+chr(104), chr(45)+chr(112))\"'"
 }"""
     },
+
+    # === CRYPTO / STEGO / FORENSICS ===
+    {
+        "role": "user",
+        "content": """Target: Local Challenge File
+Phase: EXPLOITATION
+Last result: Found secret image 'challenge.png' and encoded string 'aGFsY3Rme2NyeXB0b19tYXN0ZXJfMjAyNn0='
+Previous findings: Crypto/Stego challenge
+
+What's your next action?"""
+    },
+    {
+        "role": "assistant",
+        "content": """{
+  "thought": "The string 'aGFsY3Rme2NyeXB0b19tYXN0ZXJfMjAyNn0=' ends with '=' which indicates Base64 encoding. I will decode it using python or base64 command to check for the flag. I will also check the image metadata with exiftool.",
+  "action": "shell",
+  "action_input": "echo 'aGFsY3Rme2NyeXB0b19tYXN0ZXJfMjAyNn0=' | base64 -d; exiftool challenge.png"
+}"""
+    },
+
+    # === PWN / REVERSE ENGINEERING ===
+    {
+        "role": "user",
+        "content": """Target: Binary file 'vuln_elf'
+Phase: ENUMERATION
+Last result: Downloaded binary 'vuln_elf'. Need to inspect security controls.
+Previous findings: Binary exploitation task
+
+What's your next action?"""
+    },
+    {
+        "role": "assistant",
+        "content": """{
+  "thought": "I need to inspect the binary's protections (NX, ASLR, PIE, Canary) and check printable strings or symbols. I'll use checksec and strings.",
+  "action": "shell",
+  "action_input": "checksec --file=vuln_elf 2>/dev/null || file vuln_elf; strings vuln_elf | grep -i flag"
+}"""
+    },
 ]
 
 
