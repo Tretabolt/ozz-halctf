@@ -33,20 +33,16 @@ class DomainSolverRegistry:
         import importlib
         import pkgutil
         import sys
-        try:
-            pkg = importlib.import_module(package_name)
-            for _, modname, ispkg in pkgutil.iter_modules(pkg.__path__):
-                if not ispkg:
-                    full_name = f"{package_name}.{modname}"
-                    try:
-                        if full_name in sys.modules:
-                            importlib.reload(sys.modules[full_name])
-                        else:
-                            importlib.import_module(full_name)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        modules_to_load = ["web", "privesc", "forensics", "pwn_rev", "crypto"]
+        for mod in modules_to_load:
+            full_name = f"{package_name}.{mod}"
+            try:
+                if full_name in sys.modules:
+                    importlib.reload(sys.modules[full_name])
+                else:
+                    importlib.import_module(full_name)
+            except Exception:
+                pass
 
 
 def register_solver(domain_type: str):
