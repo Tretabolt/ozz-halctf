@@ -1,4 +1,17 @@
+---
+adr_id: "ADR-002"
+title: "Formalização dos DomainSolvers e TacticalStrategy no Espaço Executivo (𝒳)"
+status: "Approved"
+date: "2026-07-25"
+author: "ozz-halctf team"
+
+spec_dependency_status: "AHEAD_OF_DRAFT"
+spec_review_trigger: "SPEC-003 fechar — revisar tupla X=(Ω,A,P,R,ΣDomainSolvers) e agent/domains/ antes de qualquer merge nesses módulos. Ver BACKLOG.md BL-002."
+code_adr_order: "CODE_BEFORE_ADR"
+---
+
 # ADR-002: Formalização dos DomainSolvers e TacticalStrategy no Espaço Executivo (𝒳)
+
 
 **Status:** Aprovado  
 **Data:** 25 de Julho de 2026  
@@ -34,5 +47,22 @@ Para evitar a existência de "peças órfãs" fora da formalização matemática
 
 ## 3. Consequências
 
-- **Harmonia Taxonômica 100%**: Toda peça do agente `ozz-halctf` pertence formalmente a um dos 4 espaços matemáticos ($S, E, \mathcal{X}, \mathcal{P}$). Zero peças órfãs.
-- **Transparência de Limites**: O `MANIFESTO-RECON-ADAPTER.md` permanece intacto e focado no Espaço $E$, enquanto o `ADR-002` governa a inteligência ofensiva em $\mathcal{X}$.
+- **Hipótese de Alocação Taxonômica**: Toda peça do agente `ozz-halctf` tem uma hipótese
+  explicitamente declarada de alocação em um dos 4 espaços matemáticos ($S, E, \mathcal{X},
+  \mathcal{P}$). Esta hipótese é consistente com o espírito qualitativo do PDF do MNHI 3.5,
+  mas não constitui formalização completa enquanto SPEC-003 permanecer em rascunho. A tupla
+  $\mathcal{X}(t) = (\Omega, A, P, R, \sum\text{DomainSolvers})$ foi definida localmente para
+  estruturar o código existente — não está fechada em nenhuma spec publicada.
+- **Transparência de Limites**: O `MANIFESTO-RECON-ADAPTER.md` permanece intacto e focado no
+  Espaço $E$, enquanto o `ADR-002` governa a inteligência ofensiva em $\mathcal{X}$.
+
+---
+
+## 4. Dependências e Riscos
+
+| Dependência | Status | Ação se mudar |
+|---|---|---|
+| SPEC-003 (definição formal de $\mathcal{X}$) | **Rascunho** | Se SPEC-003 fechar e redefinir $\mathcal{X}$, revisar este ADR e `agent/domains/` antes de qualquer merge que toque esses módulos. |
+
+**Rastreamento**: qualquer PR que toque `agent/domains/` ou `agent/nedk.py::Executive` deve
+referenciar `docs/BACKLOG.md` item BL-002 e verificar se SPEC-003 foi fechada.

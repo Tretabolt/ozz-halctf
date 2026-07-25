@@ -14,11 +14,11 @@ class TestAutoDiscovery(unittest.TestCase):
     def test_pkgutil_autodiscovery_registers_solvers(self):
         """DomainSolverRegistry deve descobrir e registrar solvers em agent.domains automaticamente"""
         from agent.domains.registry import DomainSolverRegistry
-        
+
         # Reseta o registro para testar a descoberta pura
         DomainSolverRegistry._solvers.clear()
         self.assertNotIn("pwn", DomainSolverRegistry._solvers)
-        
+
         # Executa auto-descoberta
         DomainSolverRegistry.discover_solvers()
         self.assertTrue(DomainSolverRegistry.has_solver("pwn"))
@@ -62,23 +62,98 @@ class TestDomainTacticalDecisionEngine(unittest.TestCase):
     """Valida regras de negócio puras de tomada de decisão tática no PwnRevDomainSolver"""
 
     def test_evaluate_tactical_strategy_rules(self):
-        """PwnRevDomainSolver deve decidir a estratégia de exploração ideal com base nos controles de segurança"""
+        """PwnRevDomainSolver deve decidir a estratégia de exploração ideal para os 4 quadrantes"""
         from agent.domains.pwn_rev import PwnRevDomainSolver
-        from agent.dtos.domain_dtos import TacticalStrategy
 
         solver = PwnRevDomainSolver()
 
-        # Cenário 1: Sem NX -> Injection de Shellcode
+        # Quadrante 1: Sem NX -> Injection de Shellcode
         strat1 = solver.evaluate_tactical_strategy({"NX": False, "Canary": False, "PIE": False})
         self.assertEqual(strat1.strategy_name, "SHELLCODE_INJECTION")
 
-        # Cenário 2: NX ativado sem Canary -> Ret2libc Stack Overflow
+        # Quadrante 2: NX ativado sem Canary -> Ret2libc Stack Overflow
         strat2 = solver.evaluate_tactical_strategy({"NX": True, "Canary": False, "PIE": False})
         self.assertEqual(strat2.strategy_name, "RET2LIBC_STACK_OVERFLOW")
 
-        # Cenário 3: NX, Canary e PIE ativados -> Leak Canary & ROP
-        strat3 = solver.evaluate_tactical_strategy({"NX": True, "Canary": True, "PIE": True})
-        self.assertEqual(strat3.strategy_name, "LEAK_CANARY_AND_ROP")
+        # Quadrante 3: NX e Canary ativados, PIE desativado -> ROP_FIXED_BINARY_BASE
+        strat3 = solver.evaluate_tactical_strategy({"NX": True, "Canary": True, "PIE": False})
+        self.assertEqual(strat3.strategy_name, "ROP_FIXED_BINARY_BASE")
+        self.assertIn("canary_leak_primitive", strat3.prerequisites)
+        self.assertIn("libc_leak_via_plt", strat3.prerequisites)
+
+        # Quadrante 4: NX, Canary e PIE ativados -> LEAK_CANARY_AND_ROP
+        strat4 = solver.evaluate_tactical_strategy({"NX": True, "Canary": True, "PIE": True})
+        self.assertEqual(strat4.strategy_name, "LEAK_CANARY_AND_ROP")
+
+
+class TestBinaryPathAndSolverValidation(unittest.TestCase):
+    """Valida a pureza do BinaryPath VO e a resiliência do PwnRevDomainSolver com Ports injetadas"""
+
+    def test_binary_path_vo_syntax_validation(self):
+        """BinaryPath deve validar sintaxe em memória sem realizar I/O."""
+        from agent.domains.pwn_rev import BinaryPath
+
+        # Validações que devem lançar ValueError
+        with self.assertRaises(ValueError):
+            BinaryPath("")
+        with self.assertRaises(ValueError):
+            BinaryPath("binary\x00name")
+        with self.assertRaises(ValueError):
+            BinaryPath("../../../etc/passwd")
+        with self.assertRaises(ValueError):
+            BinaryPath("/etc/passwd")
+        with self.assertRaises(ValueError):
+            BinaryPath("/proc/self/mem")
+        with self.assertRaises(ValueError):
+            BinaryPath(r"C:\Windows\System32\cmd.exe")
+        with self.assertRaises(ValueError):
+            BinaryPath(r"\\server\share\file")
+
+        # Validação que deve ter sucesso
+        valid = BinaryPath("binaries/target_app")
+        self.assertEqual(valid.value, "binaries/target_app")
+
+    def test_solver_analyze_with_mock_ports(self):
+        """analyze() deve usar FileReaderPort e ProcessExecutorPort sem invocar o SO."""
+        from agent.domains.pwn_rev import PwnRevDomainSolver
+        from agent.ports.file_reader import MockFileReader
+        from agent.ports.executor import MockProcessExecutor
+        from agent.dtos.domain_dtos import AnalysisRequest
+
+        # 1. Caminho inválido (sintaxe) -> INVALID_TARGET
+        solver = PwnRevDomainSolver(executor=MockProcessExecutor(), file_reader=MockFileReader())
+        rep1 = solver.analyze(AnalysisRequest(domain="pwn", target_resource="/etc/passwd"))
+        self.assertFalse(rep1.success)
+        self.assertIn("INVALID_TARGET", rep1.errors[0])
+
+        # 2. Arquivo inexistente no disco -> FILE_NOT_FOUND
+        solver_no_file = PwnRevDomainSolver(
+            executor=MockProcessExecutor(),
+            file_reader=MockFileReader(exists_return=False)
+        )
+        rep2 = solver_no_file.analyze(AnalysisRequest(domain="pwn", target_resource="target_bin"))
+        self.assertFalse(rep2.success)
+        self.assertIn("FILE_NOT_FOUND", rep2.errors[0])
+
+        # 3. Formato não-ELF (ex: PE header b"MZ") -> INVALID_FORMAT
+        solver_pe = PwnRevDomainSolver(
+            executor=MockProcessExecutor(),
+            file_reader=MockFileReader(exists_return=True, header_return=b"MZ\x90\x00")
+        )
+        rep3 = solver_pe.analyze(AnalysisRequest(domain="pwn", target_resource="target_bin"))
+        self.assertFalse(rep3.success)
+        self.assertIn("INVALID_FORMAT", rep3.errors[0])
+
+        # 4. Formato ELF válido -> Sucesso via readelf mock
+        mock_exec = MockProcessExecutor(mock_output="0x0000000000000001 (NEEDED) Shared library: [libc.so.6]", exit_code=0)
+        solver_elf = PwnRevDomainSolver(
+            executor=mock_exec,
+            file_reader=MockFileReader(exists_return=True, header_return=b"\x7fELF")
+        )
+        rep4 = solver_elf.analyze(AnalysisRequest(domain="pwn", target_resource="target_bin"))
+        self.assertTrue(rep4.success)
+        self.assertEqual(len(mock_exec.executed_commands), 1)
+        self.assertEqual(mock_exec.executed_commands[0].binary, "readelf")
 
 
 if __name__ == "__main__":

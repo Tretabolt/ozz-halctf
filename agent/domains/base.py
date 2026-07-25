@@ -3,13 +3,20 @@ from abc import ABC, abstractmethod
 from typing import Optional
 from ..ports.executor import ProcessExecutorPort
 from ..infra.executor import SafeProcessExecutor
+from ..ports.file_reader import FileReaderPort
+from ..infra.file_reader import SafeFileReader
 from ..dtos.domain_dtos import AnalysisRequest, DomainAnalysisReport
 
 class BaseDomainSolver(ABC):
     """Contrato base para Solvers de Domínio Hexagonais."""
 
-    def __init__(self, executor: Optional[ProcessExecutorPort] = None):
+    def __init__(
+        self,
+        executor: Optional[ProcessExecutorPort] = None,
+        file_reader: Optional[FileReaderPort] = None,
+    ):
         self.executor = executor or SafeProcessExecutor()
+        self.file_reader = file_reader or SafeFileReader()
 
     @property
     @abstractmethod

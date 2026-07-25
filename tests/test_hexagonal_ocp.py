@@ -13,11 +13,13 @@ class TestPortsAndAdapters(unittest.TestCase):
     def test_mock_executor_port_injection(self):
         """Verifica se o solver de domínio executa via MockProcessExecutor sem invocar o SO"""
         from agent.ports.executor import MockProcessExecutor
+        from agent.ports.file_reader import MockFileReader
         from agent.domains.pwn_rev import PwnRevDomainSolver
         from agent.dtos.domain_dtos import AnalysisRequest
 
         mock_executor = MockProcessExecutor(mock_output="ELF 64-bit LSB executable")
-        solver = PwnRevDomainSolver(executor=mock_executor)
+        mock_file_reader = MockFileReader(exists_return=True, header_return=b"\x7fELF")
+        solver = PwnRevDomainSolver(executor=mock_executor, file_reader=mock_file_reader)
         
         req = AnalysisRequest(domain="pwn", target_resource="sample.elf")
         report = solver.analyze(req)
