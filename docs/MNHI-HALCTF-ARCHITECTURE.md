@@ -1,4 +1,4 @@
-# MNHI-HALctf: Arquitetura do Agente Cognitivo Autônomo (MNHI 3.5)
+# MNHI-HALctf: Arquitetura do Agente Cognitivo Autônomo (MNHI 3.5 — Release v1.4.1)
 
 ## Visão
 
@@ -74,78 +74,54 @@ $$\mathcal{P} = ( C, H, \sigma )$$
 
 ---
 
-## Estrutura do Substrato Físico (E1 Layer / Docker)
+## Arquitetura Hexagonal & Bounded Contexts (Release v1.4.1)
 
-A infraestrutura é projetada para garantir **alta disponibilidade e resiliência**:
+### 1. Hexagonal Ports & Adapters (Isolamento de I/O de SO)
+- **Porta**: `ProcessExecutorPort` (`agent/ports/executor.py`) — Contrato abstrato `execute(spec: CommandSpec) -> ExecutionResult`. Permite injeção de `MockProcessExecutor` nos testes sem requerer binários do SO host.
+- **Adaptador de Infraestrutura**: `SafeProcessExecutor` (`agent/infra/executor.py`) — Executa via `subprocess.Popen(args, shell=False)` com argumentos parametrizados (imunidade total a Command Injection RCE).
+- **Resiliência a Deadlocks & SIGKILL**: Consome buffers assincronamente via `proc.communicate()` (evita travamento de pipes de 64KB) e aplica `proc.kill()` (SIGKILL) em caso de timeout.
+
+### 2. Auto-Discovery & OCP (`DomainSolverRegistry`)
+- `DomainSolverRegistry` (`agent/domains/registry.py`) realiza auto-descoberta de solvers via `pkgutil` + `importlib`.
+- Novos solvers decorados com `@register_solver("domain")` são registrados dinamicamente na primeira consulta sem alterar nenhuma linha da Façade `ExploitArsenal` (cumprimento estrito do Open/Closed Principle).
+
+### 3. DTOs & Value Objects Tipados (`agent/dtos/domain_dtos.py`)
+- `CommandSpec`: Especificação de comando isolado (`binary`, `args`, `timeout`).
+- `ExecutionResult`: Resultado da execução (`output`, `exit_code`, `success`, `error`).
+- `AnalysisRequest`: Requisição agnóstica (`domain`, `target_resource`, `options`).
+- `DomainAnalysisReport`: Relatório de análise do solver (`domain`, `success`, `observations`, `errors`).
+- `TacticalStrategy`: Value Object de decisão tática (`strategy_name`, `target_vulnerability`, `prerequisites`).
+
+### 4. Segurança Estática (Zero-Trust)
+- **Eliminação Total de `ldd`**: Análise estática segura via **`readelf -d`** e **`objdump -p`**, evitando a execução maliciosa de código via `ld-linux.so` / `DT_RPATH`.
+
+---
+
+## Substrato Físico (E1 Layer / Docker)
+
 - **Dual-Engine Server (`scripts/hf_server.py` + vLLM)**:
-  - Se GPU com compute capability $\ge \text{sm\_75}$ estiver disponível $\rightarrow$ Inicializa **vLLM**.
-  - Em GPUs mais antigas (Tesla P100 $\text{sm\_60}$) ou ambientes CPU $\rightarrow$ Chaveia automaticamente para **PyTorch Native FP16 / CPU FP32 fallback**.
-- **Contrato OpenAI-API**: Barramento em `http://localhost:8000/v1/` 100% preservado.
+  - GPU $\ge \text{sm\_75}$ $\rightarrow$ vLLM.
+  - Tesla P100 ($\text{sm\_60}$) ou CPU $\rightarrow$ PyTorch Native FP16 / CPU FP32 fallback.
+- **OpenAI-API Contract**: `http://localhost:8000/v1/`.
 
 ---
 
-## O Universo Sintético de Testes
-
-### Topologia de Rede
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    NETWORK: 10.0.0.0/24                  │
-│                                                          │
-│  ┌──────────────┐    ┌──────────────┐    ┌────────────┐ │
-│  │  TARGET-01   │    │  TARGET-02   │    │ TARGET-03  │ │
-│  │  10.0.0.10   │    │  10.0.0.20   │    │ 10.0.0.30  │ │
-│  │              │    │              │    │            │ │
-│  │  Web Vuln    │    │  SSH + SMB   │    │  API REST  │ │
-│  │  (DVWA-like) │    │  (Debian)    │    │  (custom)  │ │
-│  │              │    │              │    │            │ │
-│  │  flag{web_   │    │  flag{ssh_   │    │ flag{api_  │ │
-│  │   master}    │    │   ghost}     │    │  breaker}  │ │
-│  └──────┬───────┘    └──────┬───────┘    └─────┬──────┘ │
-│         │                   │                   │        │
-│         └───────────┬───────┘                   │        │
-│                     │                           │        │
-│              ┌──────▼───────┐                   │        │
-│              │  TARGET-04   │◄──────────────────┘        │
-│              │  10.0.0.40   │                            │
-│              │              │                            │
-│              │  Internal    │                            │
-│              │  Database    │                            │
-│              │  (MySQL)     │                            │
-│              │              │                            │
-│              │  flag{deep_  │                            │
-│              │   vault}     │                            │
-│              │              │                            │
-│              │  + MEGA FLAG │                            │
-│              │  flag{halctf_│                            │
-│              │   king}      │                            │
-│              └──────────────┘                            │
-│                                                          │
-│  ┌──────────────┐                                       │
-│  │  OZZ AGENT   │                                       │
-│  │  10.0.0.100  │                                       │
-│  │  (Docker)    │                                       │
-│  └──────────────┘                                       │
-└─────────────────────────────────────────────────────────┘
-```
-
----
-
-## Validação e Qualidade (Suíte TDD de 30 Testes)
-
-A integridade arquitetural é garantida por **30 testes automatizados** (100% PASS):
+## Suíte TDD Certificada (47 Testes PASS 100%)
 
 | Suíte de Testes | Quantidade | Escopo de Validação |
 |------------------|------------|---------------------|
 | `test_nedk.py` | 17 testes | Espaços $S$, $E$, $\mathcal{X}$, $\mathcal{P}$, $\Psi$-Stabilizer e NEDK. |
-| `test_recon_adapter.py` | 3 testes | Contratos do manifesto, determinismo de $\tau$, ACL e limite de $\le 70$ LOC. |
+| `test_recon_adapter.py` | 3 testes | Contratos do manifesto, determinismo de $\tau$, ACL e $\le 70$ LOC. |
 | `test_nedk_recon_coupling.py` | 3 testes | Pub/Sub no `EventMesh` e atualização reativa do $G(t)$ e $\tau(t)$. |
 | `test_docker_build.py` | 3 testes | Integridade do `Dockerfile`, `hf_server.py` e scripts de fallback. |
 | `test_e2e_docker_compose.py` | 2 testes | Validação do `docker-compose.full.yml` e `mock_runner.py`. |
 | `test_kaggle_deploy.py` | 2 testes | Especificações de GPU e metadados de execução remota. |
+| `test_ctf_training.py` | 3 testes | Exemplos Few-Shot de Crypto/Forense/Pwn e checklists. |
+| `test_architecture_security.py` | 6 testes | Bounded Contexts, Façade, substituição do `ldd` por `readelf` e resiliência a dados corrompidos. |
+| `test_hexagonal_ocp.py` | 4 testes | Injeção de `MockProcessExecutor`, `SafeProcessExecutor` (shell=False) e OCP. |
+| `test_autodiscovery_deadlock_rules.py` | 4 testes | Auto-discovery `pkgutil`, `SIGKILL` em timeouts, tratamento de erros de infra e regras táticas de decisão. |
+| **TOTAL** | **47 testes** | **100% PASS (0 failures, 0 errors)** |
 
 ---
 
-*"O agente não é o código. O agente é o padrão que emerge quando
-quatro espaços matemáticos dançam juntos sobre um campo de eventos."*
-— MNHI 3.5 / Ozz NEDK Kernel, 2026
+*"O agente não é o código. O agente é o padrão que emerge quando quatro espaços matemáticos dançam juntos sobre um campo de eventos."*
