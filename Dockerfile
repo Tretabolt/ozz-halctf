@@ -51,21 +51,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Remove EXTERNALLY-MANAGED marker
 RUN rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
 
-# Python dependencies
+# Python dependencies (PyTorch, Transformers, FastAPI & Pentest libraries)
 RUN pip3 install --no-cache-dir \
-    vllm>=0.6.0 \
+    torch --index-url https://download.pytorch.org/whl/cu124 \
+    transformers \
+    accelerate \
+    fastapi \
+    uvicorn \
+    pydantic \
     requests \
     pwntools \
     beautifulsoup4 \
     lxml
 
 # Create working directories
-RUN mkdir -p /models /app /config /tmp/ozz
+RUN mkdir -p /models /app /config /tmp/ozz /tmp/hf_cache
 
-# Copy agent code
+# Copy agent code and scripts
 COPY agent/ /app/agent/
-COPY scripts/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/entrypoint.sh /app/scripts/*.sh 2>/dev/null || true
 
 # Copy wordlists (common ones)
 RUN mkdir -p /usr/share/wordlists
@@ -81,7 +86,8 @@ RUN if [ -f /usr/share/wordlists/dirb/common.txt ]; then \
 
 # Default configuration
 ENV MODEL_PATH=/models
-ENV MODEL_NAME="Qwen/Qwen2.5-Coder-7B-Instruct"
+ENV MODEL_NAME="Qwen/Qwen2.5-Coder-3B-Instruct"
+ENV HF_HOME="/tmp/hf_cache"
 ENV VLLM_PORT=8000
 ENV GPU_MEMORY_UTILIZATION=0.85
 ENV MAX_MODEL_LEN=8192

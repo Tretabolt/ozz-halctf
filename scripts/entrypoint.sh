@@ -24,24 +24,41 @@ echo "GPU Memory: $GPU_MEMORY_UTILIZATION"
 echo "Max Model Length: $MAX_MODEL_LEN"
 echo ""
 
-# Start vLLM server in background
-echo "🚀 Starting vLLM server..."
-python -m vllm.entrypoints.openai.api_server \
-    --model "$MODEL_NAME" \
-    --served-model-name "$MODEL_NAME" \
-    --host 0.0.0.0 \
-    --port "$VLLM_PORT" \
-    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
-    --trust-remote-code \
-    --dtype auto \
-    --enforce-eager \
-    &
+# Start LLM server in background (vLLM or resilient hf_server.py fallback)
+echo "🚀 Starting LLM server..."
+USE_VLLM=false
 
-VLLM_PID=$!
+if command -v nvidia-smi >/dev/null 2>&1 && python3 -c "import vllm" >/dev/null 2>&1; then
+    COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n 1 | tr -d '.')
+    if [ "$COMPUTE_CAP" -ge 75 ] 2>/dev/null; then
+        USE_VLLM=true
+    else
+        echo "⚠️ GPU Compute Capability sm_${COMPUTE_CAP} detected (< sm_75). Using resilient hf_server.py..."
+    fi
+fi
 
-# Wait for vLLM to be ready
+if [ "$USE_VLLM" = true ]; then
+    echo "⚡ Launching vLLM engine..."
+    python -m vllm.entrypoints.openai.api_server \
+        --model "$MODEL_NAME" \
+        --served-model-name "$MODEL_NAME" \
+        --host 0.0.0.0 \
+        --port "$VLLM_PORT" \
+        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+        --max-model-len "$MAX_MODEL_LEN" \
+        --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+        --trust-remote-code \
+        --dtype auto \
+        --enforce-eager \
+        &
+    SERVER_PID=$!
+else
+    echo "🛡️ Launching resilient PyTorch hf_server.py..."
+    python3 /app/scripts/hf_server.py &
+    SERVER_PID=$!
+fi
+
+# Wait for LLM server to be ready
 echo "⏳ Waiting for model server..."
 MAX_WAIT=300
 WAITED=0
@@ -57,7 +74,7 @@ done
 
 if [ $WAITED -ge $MAX_WAIT ]; then
     echo "❌ Model server failed to start within ${MAX_WAIT}s"
-    kill $VLLM_PID 2>/dev/null
+    kill $SERVER_PID 2>/dev/null
     exit 1
 fi
 
