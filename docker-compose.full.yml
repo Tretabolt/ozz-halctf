@@ -1,0 +1,105 @@
+# Ozz — Full Stack: Universe + Agent
+# docker compose up --build
+#
+# Com GPU: roda o agente com LLM real
+# Sem GPU: roda o agente com mock LLM
+
+version: "3.8"
+
+networks:
+  ctf-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24
+
+services:
+  # === TARGETS ===
+  target-01:
+    build: ./universe/target-01
+    container_name: target-01
+    hostname: target-01
+    networks:
+      ctf-net:
+        ipv4_address: 10.0.0.10
+    ports:
+      - "8081:80"
+
+  target-02:
+    build: ./universe/target-02
+    container_name: target-02
+    hostname: target-02
+    networks:
+      ctf-net:
+        ipv4_address: 10.0.0.20
+    ports:
+      - "2222:22"
+      - "4455:445"
+
+  target-03:
+    build: ./universe/target-03
+    container_name: target-03
+    hostname: target-03
+    networks:
+      ctf-net:
+        ipv4_address: 10.0.0.30
+    ports:
+      - "5000:5000"
+
+  target-04:
+    build: ./universe/target-04
+    container_name: target-04
+    hostname: target-04
+    networks:
+      ctf-net:
+        ipv4_address: 10.0.0.40
+    environment:
+      - MYSQL_ROOT_PASSWORD=***
+
+  # === SCOREBOARD ===
+  scoreboard:
+    image: python:3.11-slim
+    container_name: scoreboard
+    networks:
+      ctf-net:
+        ipv4_address: 10.0.0.200
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./universe/scoreboard:/app
+    working_dir: /app
+    command: python3 server.py
+
+  # === OZZ AGENT ===
+  # Uncomment below to run agent automatically
+  # Requires GPU: docker compose --profile agent up --build
+  ozz:
+    build: .
+    container_name: ozz-agent
+    profiles:
+      - agent
+    networks:
+      ctf-net:
+        ipv4_address: 10.0.0.100
+    environment:
+      - TARGETS=10.0.0.10,10.0.0.20,10.0.0.30
+      - MODEL_NAME=Qwen/Qwen2.5-Coder-7B-Instruct
+      - GPU_MEMORY_UTILIZATION=0.85
+      - MAX_MODEL_LEN=8192
+    volumes:
+      - ozz-models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      - target-01
+      - target-02
+      - target-03
+      - target-04
+
+volumes:
+  ozz-models:
