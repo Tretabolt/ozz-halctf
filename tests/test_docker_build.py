@@ -19,14 +19,13 @@ class TestDockerBuild(unittest.TestCase):
         )
 
     def test_dockerfile_copies_hf_server(self):
-        """Verifica se o Dockerfile inclui a cópia do hf_server.py"""
+        """Verifica se o Dockerfile inclui a cópia do diretório scripts/ (contendo hf_server.py)"""
         self.assertTrue(os.path.exists(self.dockerfile_path), "Dockerfile não encontrado")
         with open(self.dockerfile_path, "r", encoding="utf-8") as f:
             content = f.read()
-        self.assertIn(
-            "hf_server.py",
-            content,
-            "Dockerfile deve copiar o scripts/hf_server.py para garantir resiliência"
+        self.assertTrue(
+            "COPY scripts/" in content or "hf_server.py" in content,
+            "Dockerfile deve copiar o diretório scripts/ para incluir o hf_server.py"
         )
 
     def test_entrypoint_has_cuda_detection_and_fallback(self):

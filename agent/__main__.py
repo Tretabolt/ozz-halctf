@@ -5,7 +5,7 @@ import sys
 import logging
 import time
 import signal
-from agent import OzzAgent
+from agent import NEDK
 
 # Setup logging
 logging.basicConfig(
@@ -104,11 +104,11 @@ def main():
     # Get model path
     model_path = os.environ.get("MODEL_PATH", "/models")
 
-    # Create and run agent
-    agent = OzzAgent(targets=targets, model_path=model_path)
-    agent.run()
+    # Create and run the Neural Executive Dynamic Kernel
+    kernel = NEDK(targets=targets, model_path=model_path)
+    kernel.run()
 
-    logger.info("🏁 Ozz finished.")
+    logger.info("🏁 Ozz NEDK finished.")
 
 
 if __name__ == "__main__":
