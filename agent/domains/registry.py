@@ -12,16 +12,41 @@ class DomainSolverRegistry:
 
     @classmethod
     def has_solver(cls, domain_type: str) -> bool:
+        if not cls._solvers:
+            cls.discover_solvers()
         return domain_type in cls._solvers
 
     @classmethod
     def get_solver(cls, domain_type: str) -> Optional[BaseDomainSolver]:
+        if not cls._solvers:
+            cls.discover_solvers()
         solver_cls = cls._solvers.get(domain_type)
         return solver_cls() if solver_cls else None
 
     @classmethod
     def list_domains(cls) -> list[str]:
         return list(cls._solvers.keys())
+
+    @classmethod
+    def discover_solvers(cls, package_name: str = "agent.domains"):
+        """Descobre e carrega automaticamente todos os solvers no pacote agent.domains (OCP)."""
+        import importlib
+        import pkgutil
+        import sys
+        try:
+            pkg = importlib.import_module(package_name)
+            for _, modname, ispkg in pkgutil.iter_modules(pkg.__path__):
+                if not ispkg:
+                    full_name = f"{package_name}.{modname}"
+                    try:
+                        if full_name in sys.modules:
+                            importlib.reload(sys.modules[full_name])
+                        else:
+                            importlib.import_module(full_name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 def register_solver(domain_type: str):

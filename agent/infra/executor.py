@@ -9,8 +9,7 @@ class SafeProcessExecutor(ProcessExecutorPort):
     """Adaptador de infraestrutura seguro com execv (shell=False) e sanitização."""
 
     def execute(self, spec: CommandSpec) -> ExecutionResult:
-        # Sanitização e montagem do vetor de argumentos (sem shell interpolation)
-        safe_args = [spec.binary] + [shlex.quote(arg) for arg in spec.args]
+        safe_args = [spec.binary] + list(spec.args)
         try:
             proc = subprocess.Popen(
                 safe_args,
@@ -26,6 +25,22 @@ class SafeProcessExecutor(ProcessExecutorPort):
                 exit_code=proc.returncode,
                 success=(proc.returncode == 0),
                 error=err_str if proc.returncode != 0 else None
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            return ExecutionResult(
+                output="",
+                exit_code=-9,
+                success=False,
+                error="EXECUTION_TIMEOUT_KILLED: Process exceeded limit and was terminated with SIGKILL"
+            )
+        except (FileNotFoundError, PermissionError) as e:
+            return ExecutionResult(
+                output="",
+                exit_code=127,
+                success=False,
+                error=f"BINARY_NOT_FOUND: {e}"
             )
         except Exception as e:
             return ExecutionResult(output="", exit_code=1, success=False, error=str(e))

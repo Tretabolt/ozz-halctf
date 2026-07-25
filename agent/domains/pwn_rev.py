@@ -9,7 +9,7 @@ Utiliza exclusivamente ferramentas de análise estática sem execução (readelf
 from typing import List, Dict
 from .base import BaseDomainSolver
 from .registry import register_solver
-from ..dtos.domain_dtos import AnalysisRequest, DomainAnalysisReport, CommandSpec
+from ..dtos.domain_dtos import AnalysisRequest, DomainAnalysisReport, CommandSpec, TacticalStrategy
 
 @register_solver("pwn")
 @register_solver("rev")
@@ -29,12 +29,39 @@ class PwnRevDomainSolver(BaseDomainSolver):
             {"name": "Disassembly summary", "command": f"objdump -d {binary_path} | head -30 2>/dev/null"},
         ]
 
+    def evaluate_tactical_strategy(self, security_controls: Dict[str, bool]) -> TacticalStrategy:
+        """Motor de regras de decisão de domínio tático baseado nos controles de segurança."""
+        nx = security_controls.get("NX", True)
+        canary = security_controls.get("Canary", True)
+        pie = security_controls.get("PIE", True)
+
+        if not nx:
+            return TacticalStrategy(
+                strategy_name="SHELLCODE_INJECTION",
+                target_vulnerability="Executable Stack (No NX)",
+                prerequisites=["shellcode_payload", "buffer_offset"]
+            )
+        elif nx and not canary:
+            return TacticalStrategy(
+                strategy_name="RET2LIBC_STACK_OVERFLOW",
+                target_vulnerability="Stack Buffer Overflow without Canary",
+                prerequisites=["libc_base_leak", "system_address"]
+            )
+        else:
+            return TacticalStrategy(
+                strategy_name="LEAK_CANARY_AND_ROP",
+                target_vulnerability="Full Protections Enabled (Canary + PIE)",
+                prerequisites=["canary_leak_primitive", "rop_gadgets"]
+            )
+
     def analyze(self, request: AnalysisRequest) -> DomainAnalysisReport:
         spec = CommandSpec(binary="readelf", args=["-d", request.target_resource])
         exec_res = self.executor.execute(spec)
+        errors = [exec_res.error] if exec_res.error else []
         return DomainAnalysisReport(
             domain=self.domain_type,
             success=exec_res.success,
-            observations=[exec_res.output],
+            observations=[exec_res.output] if exec_res.success else [],
+            errors=errors,
             metadata={"target": request.target_resource}
         )

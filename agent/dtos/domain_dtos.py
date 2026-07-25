@@ -25,6 +25,14 @@ class AnalysisRequest:
     options: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
+class TacticalStrategy:
+    """Value Object representando uma estratégia de exploração tática decidida pelo domínio."""
+    strategy_name: str
+    target_vulnerability: str
+    prerequisites: List[str] = field(default_factory=list)
+    confidence: float = 1.0
+
+@dataclass
 class DomainAnalysisReport:
     """Relatório estruturado de análise retornado por um DomainSolver."""
     domain: str
