@@ -47,7 +47,8 @@ class Memory:
                 category TEXT,
                 key TEXT,
                 value TEXT,
-                target TEXT
+                target TEXT,
+                canonical_hash TEXT
             )
         """)
 
@@ -75,19 +76,6 @@ class Memory:
             )
         """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS tournaments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL,
-                domain TEXT,
-                target TEXT,
-                winner_name TEXT,
-                debate_summary TEXT,
-                rounds INTEGER,
-                history_json TEXT
-            )
-        """)
-
         conn.commit()
         conn.close()
         logger.info(f"Memory initialized at {self.db_path}")
@@ -105,24 +93,24 @@ class Memory:
         conn.close()
 
     def store_finding(self, category: str, key: str, value: str, target: str = ""):
-        """Store a structured finding."""
+        """Store a structured finding with canonical SHA-256 hash (tau(t))."""
+        import hashlib
+        canonical_str = f"{target}:{category}:{key}:{value}".lower()
+        canonical_hash = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
+
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute(
-            "INSERT INTO findings (timestamp, category, key, value, target) VALUES (?, ?, ?, ?, ?)",
-            (time.time(), category, key, value, target)
+            "INSERT INTO findings (timestamp, category, key, value, target, canonical_hash) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), category, key, value, target, canonical_hash)
         )
         conn.commit()
         conn.close()
 
     def store_flag(self, flag: str, source: str = "", target: str = ""):
-        """Store a found flag with idempotency check (does not duplicate identical flags)."""
+        """Store a found flag."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("SELECT id FROM flags WHERE flag = ?", (flag,))
-        if c.fetchone() is not None:
-            conn.close()
-            return  # Idempotent skip
         c.execute(
             "INSERT INTO flags (timestamp, flag, source, target) VALUES (?, ?, ?, ?)",
             (time.time(), flag, source, target)
@@ -143,52 +131,6 @@ class Memory:
         )
         conn.commit()
         conn.close()
-
-    def store_tournament_result(self, domain: str, target: str, result):
-        """Store a tournament result from TacticalHypothesisEngine."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO tournaments (timestamp, domain, target, winner_name, debate_summary, rounds, history_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                time.time(),
-                domain,
-                target,
-                getattr(result.winner, "name", str(result.winner)),
-                result.debate_summary,
-                result.rounds_executed,
-                json.dumps(result.history),
-            )
-        )
-        conn.commit()
-        conn.close()
-
-    def get_tournament_history(self, domain: str = "", limit: int = 10) -> list[dict]:
-        """Retrieve tournament history."""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        query = "SELECT domain, target, winner_name, debate_summary, rounds, timestamp FROM tournaments WHERE 1=1"
-        params = []
-        if domain:
-            query += " AND domain = ?"
-            params.append(domain)
-        query += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        c.execute(query, params)
-        results = [
-            {
-                "domain": r[0],
-                "target": r[1],
-                "winner_name": r[2],
-                "debate_summary": r[3],
-                "rounds": r[4],
-                "timestamp": r[5],
-            }
-            for r in c.fetchall()
-        ]
-        conn.close()
-        return results
 
     def get_findings(self, target: str = "", category: str = "") -> list[dict]:
         """Retrieve findings."""
@@ -254,7 +196,7 @@ class Memory:
         c = conn.cursor()
 
         stats = {}
-        for table in ["observations", "findings", "flags", "credentials", "tournaments"]:
+        for table in ["observations", "findings", "flags", "credentials"]:
             c.execute(f"SELECT COUNT(*) FROM {table}")
             stats[table] = c.fetchone()[0]
 

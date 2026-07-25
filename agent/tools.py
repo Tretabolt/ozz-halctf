@@ -12,10 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .exploits import ExploitArsenal
-
 logger = logging.getLogger("ozz.tools")
-exploits = ExploitArsenal()
 
 
 @dataclass
@@ -150,22 +147,6 @@ class ToolRegistry:
             self._wget
         ))
 
-        # ExifTool (Forensics / Metadata)
-        self.register(Tool(
-            "exiftool",
-            "Read image and document metadata for hidden information.",
-            "exiftool file.jpg",
-            lambda args: self._shell(f"exiftool {args}")
-        ))
-
-        # Binwalk (Firmware / File extraction)
-        self.register(Tool(
-            "binwalk",
-            "Analyze and extract hidden files inside binary or image files.",
-            "binwalk -e firmware.bin",
-            lambda args: self._shell(f"binwalk {args}")
-        ))
-
         # Netcat
         self.register(Tool(
             "nc",
@@ -212,62 +193,6 @@ class ToolRegistry:
             "SSH client for remote access.",
             "ssh user@target  or  ssh -i key.pem user@target",
             self._ssh
-        ))
-
-        # Reverse Shell Generator
-        self.register(Tool(
-            "reverse_shell",
-            "Generate reverse shell payloads for multiple languages.",
-            "reverse_shell LHOST LPORT [type]  (e.g., reverse_shell 10.0.0.100 4444 bash)",
-            self._reverse_shell
-        ))
-
-        # Privesc Check
-        self.register(Tool(
-            "privesc_check",
-            "Run privilege escalation enumeration checklist on compromised host.",
-            "privesc_check  (runs via shell on current target)",
-            self._privesc_check
-        ))
-
-        # SUID Exploit
-        self.register(Tool(
-            "suid_exploit",
-            "Get exploit command for known SUID binaries.",
-            "suid_exploit /usr/bin/find  (returns exploit command)",
-            self._suid_exploit
-        ))
-
-        # Web Exploit Template
-        self.register(Tool(
-            "web_exploit",
-            "Get web exploit templates (SQLi, SSTI, LFI, etc.).",
-            "web_exploit sqli_union  or  web_exploit ssti  or  web_exploit jwt",
-            self._web_exploit
-        ))
-
-        # File Transfer
-        self.register(Tool(
-            "file_transfer",
-            "Get file transfer commands between attacker and target.",
-            "file_transfer upload LHOST LPORT filename  or  file_transfer download LHOST LPORT filename",
-            self._file_transfer
-        ))
-
-        # Credential Stuffing
-        self.register(Tool(
-            "creds_list",
-            "Get list of default credentials to try.",
-            "creds_list  or  creds_list ssh  or  creds_list mysql",
-            self._creds_list
-        ))
-
-        # Searchsploit
-        self.register(Tool(
-            "searchsploit",
-            "Search ExploitDB for known exploits.",
-            "searchsploit apache 2.4",
-            self._searchsploit
         ))
 
         # Submit Flag
@@ -358,65 +283,6 @@ class ToolRegistry:
         # In a real CTF, this would submit to the scoring server
         # For HALctf, we store and report
         return ToolResult(output=f"Flag captured and stored: {flag}", success=True)
-
-    def _reverse_shell(self, args: str) -> ToolResult:
-        """Generate reverse shell payloads."""
-        parts = args.strip().split()
-        if len(parts) < 2:
-            return ToolResult(output="Usage: reverse_shell LHOST LPORT [type]", success=False)
-        lhost, lport = parts[0], parts[1]
-        shell_type = parts[2] if len(parts) > 2 else "auto"
-        payloads = exploits.reverse_shell_payload(lhost, int(lport), shell_type)
-        output = "\n".join([f"[{k}] {v}" for k, v in payloads.items()])
-        return ToolResult(output=output, success=True)
-
-    def _privesc_check(self, args: str) -> ToolResult:
-        """Run privesc enumeration."""
-        checklist = exploits.privesc_checklist()
-        output = "=== PRIVILEGE ESCALATION CHECKLIST ===\n\n"
-        for item in checklist:
-            output += f"[*] {item['name']}: {item['description']}\n"
-            output += f"    CMD: {item['command']}\n\n"
-        return ToolResult(output=output, success=True)
-
-    def _suid_exploit(self, binary: str) -> ToolResult:
-        """Get SUID exploit for a binary."""
-        binary = binary.strip()
-        suid = exploits.suid_exploits()
-        if binary in suid:
-            return ToolResult(output=f"SUID exploit for {binary}: {suid[binary]}", success=True)
-        else:
-            return ToolResult(output=f"No known SUID exploit for {binary}. Try: find / -perm -u=s -type f 2>/dev/null", success=False)
-
-    def _web_exploit(self, exploit_type: str) -> ToolResult:
-        """Get web exploit template."""
-        templates = exploits.web_exploit_templates()
-        key = exploit_type.strip().lower()
-        if key in templates:
-            return ToolResult(output=json.dumps(templates[key], indent=2), success=True)
-        else:
-            available = ", ".join(templates.keys())
-            return ToolResult(output=f"Unknown exploit type. Available: {available}", success=False)
-
-    def _file_transfer(self, args: str) -> ToolResult:
-        """Get file transfer commands."""
-        parts = args.strip().split()
-        if len(parts) < 4:
-            return ToolResult(output="Usage: file_transfer upload|download LHOST LPORT filename", success=False)
-        direction, lhost, lport, filename = parts[0], parts[1], int(parts[2]), parts[3]
-        methods = exploits.file_transfer_methods(lhost, lport, filename, direction)
-        output = f"=== FILE TRANSFER ({direction.upper()}) ===\n\n"
-        for name, cmd in methods.items():
-            output += f"[{name}]\n{cmd}\n\n"
-        return ToolResult(output=output, success=True)
-
-    def _creds_list(self, args: str) -> ToolResult:
-        """Get default credentials list."""
-        creds = exploits.default_credentials()
-        output = "=== DEFAULT CREDENTIALS ===\n"
-        for user, passwd in creds:
-            output += f"  {user}:{passwd}\n"
-        return ToolResult(output=output, success=True)
 
     def _quick_scan(self, target: str) -> ToolResult:
         """Fast comprehensive scan combining multiple tools."""

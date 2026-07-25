@@ -264,26 +264,32 @@ class OzzAgent:
 Now, what's your next action?"""
 
     def _think(self, context: str) -> Optional[dict]:
-        """Get LLM decision."""
-        try:
-            response = self.llm.generate(context)
-            # Parse JSON from response
-            # Try to extract JSON from the response
-            response = response.strip()
-            if response.startswith("```"):
-                # Remove markdown code fences
-                lines = response.split("\n")
-                response = "\n".join(lines[1:-1])
+        """Get LLM decision with Anti-Loop Psi-Stabilizer."""
+        # 1. Verificar Anti-Loop (Hash das últimas 5 ações)
+        if len(self.history) >= 5:
+            last_5 = [f"{o.tool}:{o.command}" for o in self.history[-5:]]
+            if len(set(last_5)) == 1:  # 5 ações idênticas seguidas
+                logger.warning("⚠️ Ψ-Stabilizer: Loop detectado! Forçando perturbação δS_aleatoria para mudar de foco.")
+                # Perturbação: Alternar fase ou resetar foco
+                if self.plan.state == AgentState.RECON:
+                    self.plan.state = AgentState.ENUMERATION
+                elif self.plan.state == AgentState.ENUMERATION:
+                    self.plan.state = AgentState.EXPLOITATION
+                return {
+                    "thought": "Psi-Stabilizer acionado para quebrar loop de execução repetida.",
+                    "action": "nmap",
+                    "action_input": f"-sV --top-ports 20 {self.plan.target}"
+                }
 
-            decision = json.loads(response)
-            logger.info(f"🧠 Thought: {decision.get('thought', 'N/A')}")
-            logger.info(f"🎯 Action: {decision.get('action', 'N/A')}")
-            return decision
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse LLM response as JSON: {e}")
-            logger.debug(f"Raw response: {response[:500]}")
-            # Try to salvage - maybe it's just not wrapped in JSON
-            return {"thought": response[:200], "action": "shell", "action_input": "echo 'parse error'"}
+        try:
+            decision = self.llm.generate_json(context)
+            if decision and isinstance(decision, dict):
+                logger.info(f"🧠 Thought: {decision.get('thought', 'N/A')}")
+                logger.info(f"🎯 Action: {decision.get('action', 'N/A')}")
+                return decision
+            else:
+                logger.warning("LLM respondeu sem estrutura JSON válida, usando fallback de extração.")
+                return {"thought": "Resposta sem formato JSON claro", "action": "shell", "action_input": "echo 'parse error'"}
         except Exception as e:
             logger.error(f"LLM error: {e}")
             return None

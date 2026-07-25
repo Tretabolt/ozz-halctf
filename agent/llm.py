@@ -73,15 +73,31 @@ class LLM:
             return ""
 
     def generate_json(self, prompt: str, system: Optional[str] = None) -> Optional[dict]:
-        """Generate and parse JSON response."""
+        """Generate and parse JSON response with robust extractions for Qwen 2.5 Coder."""
         response = self.generate(prompt, system)
+        if not response:
+            return None
+            
         try:
-            # Try to extract JSON from response
-            response = response.strip()
-            if response.startswith("```"):
-                lines = response.split("\n")
-                response = "\n".join(lines[1:-1])
-            return json.loads(response)
+            # 1. Tentar parse direto do texto limpo
+            cleaned = response.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
+            
+            return json.loads(cleaned)
         except json.JSONDecodeError:
+            # 2. Extração via Regex buscando o bloco JSON delimitado por chaves {}
+            import re
+            match = re.search(r"\{.*\}", response, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
             logger.warning(f"Failed to parse JSON from LLM response: {response[:200]}")
             return None
