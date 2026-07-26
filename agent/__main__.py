@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import json
 import os
 import sys
 import logging
@@ -119,8 +120,11 @@ def main():
 
     # Create and run agent
     agent = OzzAgent(targets=targets, model_path=model_path)
+    logger.info("Starting autonomous run with observability enabled.")
     agent.run()
 
+    metrics = agent.memory.get_run_metrics(run_id=agent.run_id)
+    logger.info("Run summary: %s", json.dumps(metrics, default=str))
     logger.info("Ozz finished.")
 
 

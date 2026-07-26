@@ -76,6 +76,29 @@ class Memory:
             )
         """)
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS run_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                run_id TEXT,
+                metrics_json TEXT
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                target TEXT,
+                service TEXT,
+                vulnerability TEXT,
+                action TEXT,
+                reference TEXT,
+                confidence REAL,
+                outcome TEXT
+            )
+        """)
+
         conn.commit()
         conn.close()
         logger.info(f"Memory initialized at {self.db_path}")
@@ -160,6 +183,79 @@ class Memory:
         conn.close()
         return results
 
+    def store_run_metrics(self, metrics: dict, run_id: str = ""):
+        """Persist a summarized snapshot of agent execution metrics."""
+        payload = dict(metrics)
+        payload.setdefault("run_id", run_id or f"run-{int(time.time())}")
+        payload.setdefault("timestamp", time.time())
+
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO run_metrics (timestamp, run_id, metrics_json) VALUES (?, ?, ?)",
+            (payload["timestamp"], payload["run_id"], json.dumps(payload))
+        )
+        conn.commit()
+        conn.close()
+
+    def get_run_metrics(self, run_id: str = "") -> dict:
+        """Retrieve the latest run metrics, or a specific run if provided."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        if run_id:
+            c.execute("SELECT run_id, metrics_json FROM run_metrics WHERE run_id = ? ORDER BY id DESC LIMIT 1", (run_id,))
+        else:
+            c.execute("SELECT run_id, metrics_json FROM run_metrics ORDER BY id DESC LIMIT 1")
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return {}
+        return {"run_id": row[0], **json.loads(row[1])}
+
+    def get_run_metrics_history(self) -> list[dict]:
+        """Retrieve all persisted run metrics in chronological order."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT run_id, metrics_json FROM run_metrics ORDER BY id ASC")
+        rows = c.fetchall()
+        conn.close()
+        return [{"run_id": run_id, **json.loads(metrics_json)} for run_id, metrics_json in rows]
+
+    def store_strategy_evidence(self, target: str, service: str, vulnerability: str, action: str,
+                                reference: str = "", confidence: float = 0.0,
+                                outcome: str = "unknown"):
+        """Persist a strategy recommendation tied to service/vulnerability context."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO strategy_evidence (timestamp, target, service, vulnerability, action, reference, confidence, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), target, service, vulnerability, action, reference, confidence, outcome)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_strategy_evidence(self, target: str = "") -> list[dict]:
+        """Retrieve strategy evidence entries, optionally filtered by target."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        query = "SELECT target, service, vulnerability, action, reference, confidence, outcome FROM strategy_evidence WHERE 1=1"
+        params = []
+        if target:
+            query += " AND target = ?"
+            params.append(target)
+        c.execute(query, params)
+        rows = c.fetchall()
+        conn.close()
+        return [{
+            "target": row[0],
+            "service": row[1],
+            "vulnerability": row[2],
+            "action": row[3],
+            "reference": row[4],
+            "confidence": row[5],
+            "outcome": row[6],
+        } for row in rows]
+
     def get_credentials(self, target: str = "") -> list[dict]:
         """Retrieve credentials."""
         conn = sqlite3.connect(self.db_path)
@@ -196,7 +292,7 @@ class Memory:
         c = conn.cursor()
 
         stats = {}
-        for table in ["observations", "findings", "flags", "credentials"]:
+        for table in ["observations", "findings", "flags", "credentials", "run_metrics"]:
             c.execute(f"SELECT COUNT(*) FROM {table}")
             stats[table] = c.fetchone()[0]
 

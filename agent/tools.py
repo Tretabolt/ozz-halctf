@@ -187,6 +187,20 @@ class ToolRegistry:
             self._strings
         ))
 
+        # Forensics
+        self.register(Tool(
+            "exiftool",
+            "Read metadata and embedded details from files and images.",
+            "exiftool <file>",
+            self._exiftool
+        ))
+        self.register(Tool(
+            "binwalk",
+            "Analyze firmware and binaries for embedded files and signatures.",
+            "binwalk <file>",
+            self._binwalk
+        ))
+
         # SSH
         self.register(Tool(
             "ssh",
@@ -271,6 +285,12 @@ class ToolRegistry:
 
     def _strings(self, args: str) -> ToolResult:
         return self._run_cmd(f"strings {args}")
+
+    def _exiftool(self, args: str) -> ToolResult:
+        return self._run_cmd(f"exiftool {args}", timeout=60)
+
+    def _binwalk(self, args: str) -> ToolResult:
+        return self._run_cmd(f"binwalk {args}", timeout=60)
 
     def _ssh(self, args: str) -> ToolResult:
         # SSH is tricky in autonomous mode - typically need creds

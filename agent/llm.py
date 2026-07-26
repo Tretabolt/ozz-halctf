@@ -6,6 +6,7 @@ Connects to local vLLM server or llama.cpp server.
 import logging
 import json
 import os
+import time
 import requests
 from typing import Optional
 
@@ -22,9 +23,14 @@ class LLM:
         self.model_path = model_path
         self.port = port
         self.api_url = f"http://localhost:{port}/v1"
+        self.fallback_api_url = os.environ.get("FALLBACK_API_URL")
         self.model_name = os.environ.get("MODEL_NAME", DEFAULT_MODEL)
         self.max_tokens = int(os.environ.get("MAX_TOKENS", "4096"))
         self.temperature = float(os.environ.get("TEMPERATURE", "0.3"))
+        self.max_retries = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+        self.retry_backoff = float(os.environ.get("LLM_RETRY_BACKOFF", "2"))
+        self.fallback_count = 0
+        self.last_request_was_fallback = False
         self._verify_connection()
 
     def _verify_connection(self):
@@ -41,9 +47,8 @@ class LLM:
             else:
                 logger.warning(f"LLM server returned status {resp.status_code}")
         except requests.ConnectionError:
-            logger.error(f"❌ Cannot connect to LLM server at {self.api_url}")
+            logger.warning(f"❌ Cannot connect to LLM server at {self.api_url}. Will continue and retry on demand.")
             logger.info("Make sure vLLM is running: python -m vllm.entrypoints.openai.api_server")
-            raise
 
     def generate(self, prompt: str, system: Optional[str] = None) -> str:
         """Generate a response from the LLM."""
@@ -52,25 +57,45 @@ class LLM:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        try:
-            resp = requests.post(
-                f"{self.api_url}/chat/completions",
-                json={
-                    "model": self.model_name,
-                    "messages": messages,
-                    "max_tokens": self.max_tokens,
-                    "temperature": self.temperature,
-                    "stop": ["```", "---"],
-                },
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            return content.strip()
-        except Exception as e:
-            logger.error(f"LLM generation error: {e}")
+        def request_completion(api_url: str) -> str:
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    resp = requests.post(
+                        f"{api_url}/chat/completions",
+                        json={
+                            "model": self.model_name,
+                            "messages": messages,
+                            "max_tokens": self.max_tokens,
+                            "temperature": self.temperature,
+                            "stop": ["```", "---"],
+                        },
+                        timeout=120,
+                    )
+                    if resp.status_code >= 500:
+                        raise requests.HTTPError(f"Server error {resp.status_code}: {resp.text}")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data["choices"][0]["message"]["content"]
+                    return content.strip()
+                except requests.RequestException as e:
+                    logger.error(f"LLM generation error on {api_url} (attempt {attempt}/{self.max_retries}): {e}")
+                    if attempt == self.max_retries:
+                        break
+                    time.sleep(self.retry_backoff)
+                except (ValueError, KeyError) as e:
+                    logger.error(f"LLM response parse error: {e}")
+                    return ""
             return ""
+
+        response = request_completion(self.api_url)
+        if not response and self.fallback_api_url:
+            logger.warning(f"Primary LLM endpoint failed, trying fallback at {self.fallback_api_url}")
+            response = request_completion(self.fallback_api_url)
+            if response:
+                self.last_request_was_fallback = True
+                self.fallback_count += 1
+
+        return response
 
     def generate_json(self, prompt: str, system: Optional[str] = None) -> Optional[dict]:
         """Generate and parse JSON response with robust extractions for Qwen 2.5 Coder."""

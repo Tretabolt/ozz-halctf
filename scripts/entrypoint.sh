@@ -40,25 +40,43 @@ python -m vllm.entrypoints.openai.api_server \
     &
 
 VLLM_PID=$!
+CURRENT_SERVER="vllm"
+
+function wait_for_server() {
+    local url="http://localhost:$VLLM_PORT/v1/models"
+    local max_wait=$1
+    local waited=0
+
+    while [ $waited -lt $max_wait ]; do
+        if curl -s "$url" > /dev/null 2>&1; then
+            echo "✅ Model server ready!"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        echo "  Waiting... ($waited/${max_wait}s)"
+    done
+
+    return 1
+}
 
 # Wait for vLLM to be ready
 echo "⏳ Waiting for model server..."
 MAX_WAIT=300
-WAITED=0
-while [ $WAITED -lt $MAX_WAIT ]; do
-    if curl -s http://localhost:$VLLM_PORT/v1/models > /dev/null 2>&1; then
-        echo "✅ Model server ready!"
-        break
-    fi
-    sleep 2
-    WAITED=$((WAITED + 2))
-    echo "  Waiting... ($WAITED/${MAX_WAIT}s)"
-done
-
-if [ $WAITED -ge $MAX_WAIT ]; then
-    echo "❌ Model server failed to start within ${MAX_WAIT}s"
+if ! wait_for_server $MAX_WAIT; then
+    echo "❌ vLLM server failed to start within ${MAX_WAIT}s"
     kill $VLLM_PID 2>/dev/null
-    exit 1
+
+    echo "🔁 Starting fallback HF server..."
+    python /app/scripts/hf_server.py &
+    VLLM_PID=$!
+    CURRENT_SERVER="hf_server"
+
+    if ! wait_for_server $MAX_WAIT; then
+        echo "❌ Fallback HF server failed to start within ${MAX_WAIT}s"
+        kill $VLLM_PID 2>/dev/null
+        exit 1
+    fi
 fi
 
 # Run the agent
