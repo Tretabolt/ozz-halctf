@@ -234,7 +234,7 @@ class ToolRegistry:
         return self._run_cmd(args, timeout=60)
 
     def _curl(self, args: str) -> ToolResult:
-        return self._run_cmd(f"curl -s -m 30 {args}")
+        return self._run_cmd(f"curl -s -H 'bypass-tunnel-reminder: true' -m 30 {args}")
 
     def _gobuster(self, args: str) -> ToolResult:
         return self._run_cmd(f"gobuster {args}", timeout=180)
