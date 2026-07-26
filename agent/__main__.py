@@ -1,11 +1,17 @@
 """Ozz — Entry point for the autonomous agent."""
 
+import argparse
+import io
 import os
 import sys
 import logging
 import time
 import signal
+import tempfile
 from agent import OzzAgent
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 # Setup logging
 logging.basicConfig(
@@ -13,7 +19,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/tmp/ozz.log"),
+        logging.FileHandler(os.path.join(tempfile.gettempdir(), "ozz.log")),
     ]
 )
 logger = logging.getLogger("ozz")
@@ -25,7 +31,7 @@ def wait_for_model(timeout: int = 300):
     port = int(os.environ.get("VLLM_PORT", "8000"))
     api_url = f"http://localhost:{port}/v1/models"
 
-    logger.info(f"⏳ Waiting for model server at {api_url}...")
+    logger.info(f"Waiting for model server at {api_url}...")
     start = time.time()
 
     while time.time() - start < timeout:
@@ -34,7 +40,7 @@ def wait_for_model(timeout: int = 300):
             if resp.status_code == 200:
                 models = resp.json().get("data", [])
                 if models:
-                    logger.info(f"✅ Model ready: {models[0].get('id', 'unknown')}")
+                    logger.info(f"Model ready: {models[0].get('id', 'unknown')}")
                     return True
         except requests.ConnectionError:
             pass
@@ -43,7 +49,7 @@ def wait_for_model(timeout: int = 300):
 
         time.sleep(2)
 
-    logger.error(f"❌ Model server not ready after {timeout}s")
+    logger.error(f"Model server not ready after {timeout}s")
     return False
 
 
@@ -66,29 +72,36 @@ def parse_targets() -> list[str]:
                     targets.append(line)
 
     # From command line args
-    if len(sys.argv) > 1:
-        targets.extend(sys.argv[1:])
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--target", dest="targets", action="append")
+    parser.add_argument("positional_targets", nargs="*")
+    args, _ = parser.parse_known_args(sys.argv[1:])
+
+    if args.targets:
+        targets.extend(args.targets)
+    if args.positional_targets:
+        targets.extend(args.positional_targets)
 
     if not targets:
-        logger.error("❌ No targets specified! Set TARGETS env or pass as arguments.")
+        logger.error("No targets specified! Set TARGETS env or pass as arguments.")
         sys.exit(1)
 
     # Deduplicate
     targets = list(dict.fromkeys(targets))
-    logger.info(f"🎯 Targets: {targets}")
+    logger.info(f"Targets: {targets}")
     return targets
 
 
 def main():
     """Main entry point."""
-    logger.info("🏴" + "="*58)
+    logger.info("="*58)
     logger.info("  OZZ — HALctf Autonomous Pentesting Agent")
     logger.info("  DEF CON 34 AI Village")
     logger.info("="*60)
 
     # Graceful shutdown
     def signal_handler(sig, frame):
-        logger.info("🛑 Shutting down gracefully...")
+        logger.info("Shutting down gracefully...")
         sys.exit(0)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -108,7 +121,7 @@ def main():
     agent = OzzAgent(targets=targets, model_path=model_path)
     agent.run()
 
-    logger.info("🏁 Ozz finished.")
+    logger.info("Ozz finished.")
 
 
 if __name__ == "__main__":

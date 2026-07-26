@@ -242,7 +242,7 @@ class OzzAgent:
         else:
             phase_prompt = "Continue with your current plan."
 
-        system = SYSTEM_PROMPT.format(tools_desc=tools_desc)
+        system = SYSTEM_PROMPT.replace("{tools_desc}", tools_desc)
 
         return f"""{system}
 
