@@ -3,11 +3,14 @@ Ozz — Memory Module
 SQLite-based working memory for the agent.
 """
 
+import hashlib
 import json
 import os
 import sqlite3
 import time
 import logging
+import threading
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -16,11 +19,69 @@ logger = logging.getLogger("ozz.memory")
 DB_PATH = os.environ.get("OZZ_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".openclaw", "tmp", "ozz_memory.db"))
 
 
-class Memory:
-    """SQLite-based agent memory."""
+class ContextNamespace:
+    """Isolated context namespace for a single target/session.
 
-    def __init__(self, db_path: str = DB_PATH):
+    Prevents cross-target contamination: data in one namespace
+    cannot leak into another. Cross-target sharing only via
+    explicit pivot actions.
+    """
+
+    def __init__(self, namespace_id: str, parent: Optional['Memory'] = None):
+        self.namespace_id = namespace_id
+        self.parent = parent
+        self._data: dict[str, str] = {}
+        self._provenance: dict[str, str] = {}  # key → provenance_hash
+        self._lock = threading.Lock()
+        self._created_at = time.time()
+
+    def put(self, key: str, value: str, provenance_hash: str = ""):
+        """Store data in this namespace with provenance."""
+        with self._lock:
+            self._data[key] = value
+            if provenance_hash:
+                self._provenance[key] = provenance_hash
+
+    def get(self, key: str) -> Optional[str]:
+        """Retrieve data from this namespace only."""
+        with self._lock:
+            return self._data.get(key)
+
+    def keys(self) -> list[str]:
+        """List all keys in this namespace."""
+        with self._lock:
+            return list(self._data.keys())
+
+    def get_with_provenance(self, key: str) -> tuple[Optional[str], str]:
+        """Get value and its provenance hash."""
+        with self._lock:
+            return self._data.get(key), self._provenance.get(key, "")
+
+    def to_dict(self) -> dict:
+        """Export namespace data."""
+        with self._lock:
+            return {
+                "namespace_id": self.namespace_id,
+                "created_at": self._created_at,
+                "keys": list(self._data.keys()),
+                "provenance": dict(self._provenance),
+            }
+
+
+class Memory:
+    """SQLite-based agent memory with context isolation.
+
+    Context separation: each target gets an isolated namespace.
+    Cross-target data sharing ONLY through explicit pivot actions.
+    Provenance tracking on every stored item.
+    """
+
+    def __init__(self, db_path: str = DB_PATH, session_id: str = ""):
         self.db_path = db_path
+        self.session_id = session_id or f"session-{uuid.uuid4().hex[:12]}"
+        self._current_target: str = ""
+        self._namespaces: dict[str, ContextNamespace] = {}
+        self._lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
@@ -38,7 +99,9 @@ class Memory:
                 output TEXT,
                 success BOOLEAN,
                 target TEXT,
-                phase TEXT
+                phase TEXT,
+                namespace TEXT DEFAULT '',
+                provenance_hash TEXT DEFAULT ''
             )
         """)
 
@@ -50,7 +113,9 @@ class Memory:
                 key TEXT,
                 value TEXT,
                 target TEXT,
-                canonical_hash TEXT
+                canonical_hash TEXT,
+                namespace TEXT DEFAULT '',
+                provenance_hash TEXT DEFAULT ''
             )
         """)
 
@@ -120,32 +185,93 @@ class Memory:
         conn.close()
         logger.info(f"Memory initialized at {self.db_path}")
 
+    # ── Context Namespace Management ───────────────────────────────
+
+    def set_target(self, target: str):
+        """Set the current target context. All subsequent operations are scoped to this target."""
+        self._current_target = target
+        # Ensure namespace exists
+        self.get_namespace(target)
+        logger.debug(f"Memory context set to target: {target}")
+
+    def get_namespace(self, target: str) -> ContextNamespace:
+        """Get or create an isolated namespace for a target."""
+        ns_key = f"{self.session_id}:{target}"
+        with self._lock:
+            if ns_key not in self._namespaces:
+                self._namespaces[ns_key] = ContextNamespace(ns_key, parent=self)
+            return self._namespaces[ns_key]
+
+    def get_current_namespace(self) -> ContextNamespace:
+        """Get the namespace for the current target."""
+        return self.get_namespace(self._current_target)
+
+    def pivot(self, source_target: str, dest_target: str, data_keys: list[str]) -> dict:
+        """Explicit cross-target data sharing via pivot action.
+
+        Only specified keys are transferred. Logged for audit.
+        Returns dict of transferred data.
+        """
+        source_ns = self.get_namespace(source_target)
+        dest_ns = self.get_namespace(dest_target)
+        transferred = {}
+        for key in data_keys:
+            value, prov = source_ns.get_with_provenance(key)
+            if value is not None:
+                dest_ns.put(f"pivoted:{source_target}:{key}", value, prov)
+                transferred[key] = value
+                logger.info(f"Pivot: {source_target}:{key} → {dest_target}")
+        return transferred
+
+    def get_namespace_summary(self) -> dict:
+        """Summary of all active namespaces (for audit/debug)."""
+        with self._lock:
+            return {k: ns.to_dict() for k, ns in self._namespaces.items()}
+
     def store(self, observation, target: str = "", phase: str = ""):
-        """Store an observation with target and phase."""
+        """Store an observation with target, phase, and namespace isolation."""
+        target = target or self._current_target
+        namespace = f"target:{target}"
+        provenance_hash = hashlib.sha256(
+            f"{self.session_id}:{namespace}:{observation.tool}:{observation.command}".encode()
+        ).hexdigest()
+
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute(
-            "INSERT INTO observations (timestamp, tool, command, output, success, target, phase) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO observations (timestamp, tool, command, output, success, target, phase, namespace, provenance_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (observation.timestamp, observation.tool, observation.command,
-             observation.output, observation.success, target, phase)
+             observation.output, observation.success, target, phase, namespace, provenance_hash)
         )
         conn.commit()
         conn.close()
+
+        # Also store in namespace
+        ns = self.get_namespace(target)
+        ns.put(f"obs:{observation.tool}:{int(observation.timestamp)}", observation.output[:500], provenance_hash)
 
     def store_finding(self, category: str, key: str, value: str, target: str = ""):
-        """Store a structured finding with canonical SHA-256 hash (tau(t))."""
-        import hashlib
+        """Store a structured finding with canonical SHA-256 hash and provenance."""
+        target = target or self._current_target
+        namespace = f"target:{target}"
         canonical_str = f"{target}:{category}:{key}:{value}".lower()
         canonical_hash = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
+        provenance_hash = hashlib.sha256(
+            f"{self.session_id}:{namespace}:{category}:{key}:{value}".encode()
+        ).hexdigest()
 
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute(
-            "INSERT INTO findings (timestamp, category, key, value, target, canonical_hash) VALUES (?, ?, ?, ?, ?, ?)",
-            (time.time(), category, key, value, target, canonical_hash)
+            "INSERT INTO findings (timestamp, category, key, value, target, canonical_hash, namespace, provenance_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), category, key, value, target, canonical_hash, namespace, provenance_hash)
         )
         conn.commit()
         conn.close()
+
+        # Store in namespace
+        ns = self.get_namespace(target)
+        ns.put(f"finding:{category}:{key}", value, provenance_hash)
 
     def store_flag(self, flag: str, source: str = "", target: str = ""):
         """Store a found flag (idempotent — same flag+target won't duplicate)."""

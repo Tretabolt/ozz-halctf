@@ -24,6 +24,16 @@ from .llm import LLM
 from .memory import Memory
 from .tools import ToolRegistry, ToolResult
 from .few_shot import get_few_shot_messages
+from .context_engine import ContextEngine
+from .reports import ActionReportBuilder
+from .metrics import MetricsIntegration
+from .provenance import ProvenanceTracker
+from .audit import AuditLogger
+from .contamination import ContaminationDetector
+from .telemetry.monitor import TelemetryMonitor, PromptRisk
+from .telemetry.sanitizer import TelemetrySanitizer
+from .telemetry.evaluator import DeterministicEvaluator
+from .telemetry.audit_trail import AuditTrail, AuditEventType
 
 logger = logging.getLogger("ozz")
 
@@ -261,14 +271,43 @@ class OzzAgent:
     def __init__(self, targets: list[str], model_path: str = "/models",
                  nedk=None, scoreboard_url: str = ""):
         self.targets = targets
+        self.run_id = f"run-{int(time.time() * 1000)}"
+
+        # ── Security modules (DEF CON 34 AI Village) ────────────────
+        self.provenance = ProvenanceTracker(session_id=self.run_id)
+        self.audit = AuditLogger(session_id=self.run_id)
+        self.contamination = ContaminationDetector(session_id=self.run_id)
+
+        # ── Telemetry & SOC Defense (Track D: DEF CON 34 Posters) ───
+        self.telemetry_monitor = TelemetryMonitor(agent_id="ozz", run_id=self.run_id)
+        self.telemetry_sanitizer = TelemetrySanitizer(strict=True)
+        self.telemetry_evaluator = DeterministicEvaluator()
+        self.audit_trail = AuditTrail(agent_id="ozz", run_id=self.run_id)
+        self.audit_trail.log_session_event(AuditEventType.SESSION_START, {
+            "targets": list(targets),
+            "max_iterations": self.max_iterations,
+        })
+
+        # ── Track E: Red Team Methodology & Deception at Scale ─────
+        from .deception import BifurcationEngine
+        from .fingerprinting import BehavioralFingerprint
+        from .self_test import ScaleTestPipeline
+        self.bifurcation = BifurcationEngine()
+        self.fingerprinter = BehavioralFingerprint()
+        self.self_test = ScaleTestPipeline(validate_fn=self._selftest_validate)
+
         self.llm = LLM(model_path)
-        self.memory = Memory()
-        self.tools = ToolRegistry()
+        self.memory = Memory(session_id=self.run_id)
+        self.tools = ToolRegistry(
+            allowed_targets=targets,
+            audit_logger=self.audit,
+            provenance_tracker=self.provenance,
+            contamination_detector=self.contamination,
+        )
         self.plan = Plan(objective="Find and capture all flags")
         self.history: list[Observation] = []
         self.max_iterations = MAX_ITERATIONS
         self.current_target_idx = 0
-        self.run_id = f"run-{int(time.time() * 1000)}"
         self.nedk = nedk  # Optional NEDK composition
 
         # Scoreboard
@@ -302,12 +341,17 @@ class OzzAgent:
         }
         self._last_phase: Optional[AgentState] = None
 
+        # Track A: Context Engineering, Auto-Documentation, Metrics
+        self.context_engine = ContextEngine()
+        self.report = ActionReportBuilder(run_id=self.run_id)
+        self.metrics = MetricsIntegration(run_id=self.run_id)
+
     # ============================================================
     # MAIN LOOP
     # ============================================================
 
     def run(self):
-        """Main agent loop — full ReAct cycle."""
+        """Main agent loop — full ReAct cycle with phase-specific sub-loops."""
         logger.info(f"🏴 Ozz starting. Targets: {self.targets}")
         logger.info(f"   Scoreboard: {'enabled' if self.scoreboard.enabled else 'disabled (local only)'}")
         logger.info(f"   Max iterations: {self.max_iterations}")
@@ -315,19 +359,24 @@ class OzzAgent:
 
         self.plan.state = AgentState.RECON
         self.plan.target = self.targets[0] if self.targets else ""
+        self.report.set_target(self.plan.target)
 
         for i in range(self.max_iterations):
             self.run_metrics["iterations"] = i + 1
+            self.telemetry_monitor.set_iteration(i + 1)
 
             if self.plan.state == AgentState.DONE:
                 logger.info("🏁 Agent completed all objectives.")
+                self.audit_trail.log_session_event(AuditEventType.SESSION_END, {
+                    "flags_found": len(self.plan.flags_found),
+                    "total_iterations": i + 1,
+                })
                 break
 
             # Circuit breaker check
             if self._consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
                 logger.error(f"🛑 Circuit breaker triggered after {self._consecutive_failures} consecutive failures.")
                 self.run_metrics["circuit_breaks"] += 1
-                # Try to recover by switching target or state
                 if not self._try_circuit_breaker_recovery():
                     logger.error("🛑 Cannot recover. Stopping.")
                     break
@@ -337,40 +386,25 @@ class OzzAgent:
             logger.info(f"  Consecutive failures: {self._consecutive_failures} | Delay: {self._current_delay:.1f}s")
             logger.info(f"{'='*60}")
 
-            # 1. BUILD CONTEXT
-            context = self._build_context()
+            # Use phase-specific sub-loops for focused execution
+            observation = self._run_sub_loop(i)
 
-            # 2. THINK — LLM decides (no hardcoded overrides)
-            decision = self._think(context)
-            if not decision:
-                self._consecutive_failures += 1
-                self._backoff()
+            if observation is None:
                 continue
 
-            # 3. VALIDATE decision structure
-            if not self._validate_decision(decision):
-                logger.warning(f"Invalid decision structure: {decision}")
-                self._consecutive_failures += 1
-                continue
-
-            # 4. ACT — execute tool
-            observation = self._act(decision)
-
-            # 5. REMEMBER — store and interpret
-            self._remember(observation)
-
-            # 6. CHECK FLAGS
+            # CHECK FLAGS
             new_flags = self._extract_flags(observation.output)
             for flag in new_flags:
                 self._handle_flag(flag, observation)
 
-            # 7. UPDATE STATE
-            self._update_state(decision, observation)
+            # UPDATE STATE
+            self._update_state({}, observation)
 
-            # 8. TRACK EFFECTIVENESS
-            self._track_effectiveness(decision, observation)
-
-            # 9. LOOP DETECTION
+            # LOOP DETECTION
+            self.audit_trail.log_tool_result(
+                observation.tool, observation.success, len(observation.output),
+                0.0, iteration=i + 1
+            )
             if self._detect_loop():
                 self._break_loop()
 
@@ -382,7 +416,280 @@ class OzzAgent:
         self.run_metrics["flags_found"] = len(self.plan.flags_found)
         self.run_metrics["flags_submitted"] = len(self.scoreboard.submitted)
         self.memory.store_run_metrics(self.run_metrics, run_id=self.run_id)
+
+        # Telemetry final stats (Track D)
+        self.audit_trail.log_session_event(AuditEventType.SESSION_END, {
+            "flags_found": len(self.plan.flags_found),
+            "total_iterations": self.run_metrics["iterations"],
+            "telemetry_stats": self.telemetry_monitor.get_stats(),
+            "sanitizer_stats": self.telemetry_sanitizer.get_stats(),
+            "evaluator_stats": self.telemetry_evaluator.get_statistics(),
+            "audit_stats": self.audit_trail.get_statistics(),
+        })
+        chain_valid, broken_at = self.audit_trail.verify_chain()
+        logger.info(f"📋 Audit trail: {len(self.audit_trail._entries)} entries, chain valid={chain_valid}")
+        self._finalize_reports()
         self._report()
+
+    # ============================================================
+    # SUB-LOOPS — Phase-Specific ReAct Loops
+    # ============================================================
+
+    def _run_sub_loop(self, global_iteration: int) -> Optional[Observation]:
+        """Route to the appropriate phase-specific sub-loop."""
+        self.report.set_phase(self.plan.state.value)
+        self.report.set_target(self.plan.target)
+
+        sub_loop_map = {
+            AgentState.RECON: self._recon_loop,
+            AgentState.ENUMERATION: self._enum_loop,
+            AgentState.EXPLOITATION: self._exploit_loop,
+            AgentState.POST_EXPLOIT: self._post_exploit_loop,
+            AgentState.PIVOT: self._exploit_loop,
+        }
+
+        loop_fn = sub_loop_map.get(self.plan.state)
+        if loop_fn is None:
+            return self._generic_iteration(global_iteration)
+
+        return loop_fn(global_iteration)
+
+    def _recon_loop(self, global_iteration: int) -> Optional[Observation]:
+        """
+        Recon sub-loop: host discovery → service detection → technology fingerprinting.
+        Max 20 iterations before forcing transition.
+        """
+        max_recon_iters = _env_int("OZZ_RECON_MAX_ITERS", 20)
+        recon_iter = self.run_metrics.get("_recon_iters", 0)
+        if recon_iter >= max_recon_iters:
+            logger.info("📊 Recon iteration limit reached, transitioning to ENUMERATION")
+            self.plan.state = AgentState.ENUMERATION
+            self.run_metrics["_recon_iters"] = 0
+            return None
+        self.run_metrics["_recon_iters"] = recon_iter + 1
+
+        recon_tools = "nmap, quick_scan, whatweb, curl, shell"
+        recon_prompt = f"""RECON PHASE — Target: {self.plan.target}
+Goal: Discover services, ports, and technologies.
+Available tools: {recon_tools}
+Findings so far: {json.dumps(self.plan.findings, default=str)[:500]}
+
+What is your next recon action? Respond with JSON: {{"thought": "...", "action": "tool", "action_input": "..."}}"""
+
+        return self._sub_loop_think_and_act(recon_prompt, global_iteration)
+
+    def _enum_loop(self, global_iteration: int) -> Optional[Observation]:
+        """
+        Enumeration sub-loop: endpoint discovery → parameter fuzzing → vulnerability identification.
+        Max 30 iterations before forcing transition.
+        """
+        max_enum_iters = _env_int("OZZ_ENUM_MAX_ITERS", 30)
+        enum_iter = self.run_metrics.get("_enum_iters", 0)
+        if enum_iter >= max_enum_iters:
+            logger.info("📊 Enum iteration limit reached, transitioning to EXPLOITATION")
+            self.plan.state = AgentState.EXPLOITATION
+            self.run_metrics["_enum_iters"] = 0
+            return None
+        self.run_metrics["_enum_iters"] = enum_iter + 1
+
+        enum_tools = "gobuster, ffuf, nikto, curl, sqlmap, shell"
+        ctx_summary = self.context_engine.build_filtered_context(max_network=10, max_categories=3)
+
+        enum_prompt = f"""ENUMERATION PHASE — Target: {self.plan.target}
+Goal: Discover endpoints, parameters, and vulnerabilities.
+Available tools: {enum_tools}
+Services: {json.dumps(self.plan.findings.get('services', []), default=str)[:300]}
+Filtered Context:
+{ctx_summary[:600]}
+
+What is your next enumeration action? Respond with JSON: {{"thought": "...", "action": "tool", "action_input": "..."}}"""
+
+        return self._sub_loop_think_and_act(enum_prompt, global_iteration)
+
+    def _exploit_loop(self, global_iteration: int) -> Optional[Observation]:
+        """
+        Exploit sub-loop: payload generation → execution → verification → flag extraction.
+        Max 50 iterations.
+        """
+        max_exploit_iters = _env_int("OZZ_EXPLOIT_MAX_ITERS", 50)
+        exploit_iter = self.run_metrics.get("_exploit_iters", 0)
+        if exploit_iter >= max_exploit_iters:
+            logger.info("📊 Exploit iteration limit reached")
+            if self.plan.flags_found:
+                self.plan.state = AgentState.POST_EXPLOIT
+            self.run_metrics["_exploit_iters"] = 0
+            return None
+        self.run_metrics["_exploit_iters"] = exploit_iter + 1
+
+        exploit_tools = "curl, sqlmap, python, shell, gobuster, ffuf"
+        creds_summary = json.dumps(self.plan.credentials, default=str)[:300] if self.plan.credentials else "None"
+
+        exploit_prompt = f"""EXPLOITATION PHASE — Target: {self.plan.target}
+Goal: Exploit vulnerabilities to capture flags.
+Available tools: {exploit_tools}
+Vulnerabilities: {json.dumps(self.plan.findings.get('vulnerabilities', []), default=str)[:300]}
+Credentials: {creds_summary}
+Flags found: {self.plan.flags_found}
+
+What is your next exploit action? Respond with JSON: {{"thought": "...", "action": "tool", "action_input": "..."}}"""
+
+        return self._sub_loop_think_and_act(exploit_prompt, global_iteration)
+
+    def _post_exploit_loop(self, global_iteration: int) -> Optional[Observation]:
+        """
+        Post-exploit sub-loop: privilege escalation → lateral movement → data exfiltration.
+        Max 30 iterations.
+        """
+        max_post_iters = _env_int("OZZ_POST_EXPLOIT_MAX_ITERS", 30)
+        post_iter = self.run_metrics.get("_post_iters", 0)
+        if post_iter >= max_post_iters:
+            logger.info("📊 Post-exploit iteration limit reached")
+            if self.current_target_idx < len(self.targets) - 1:
+                self.current_target_idx += 1
+                self.plan.target = self.targets[self.current_target_idx]
+                self.plan.state = AgentState.RECON
+                self.report.set_target(self.plan.target)
+            else:
+                self.plan.state = AgentState.DONE
+            self.run_metrics["_post_iters"] = 0
+            return None
+        self.run_metrics["_post_iters"] = post_iter + 1
+
+        post_tools = "shell, python, ssh, curl, grep"
+
+        post_prompt = f"""POST-EXPLOIT PHASE — Target: {self.plan.target}
+Goal: Search for flags, escalate privileges, find pivot opportunities.
+Available tools: {post_tools}
+Credentials: {json.dumps(self.plan.credentials, default=str)[:300]}
+Flags so far: {self.plan.flags_found}
+
+What is your next post-exploit action? Respond with JSON: {{"thought": "...", "action": "tool", "action_input": "..."}}"""
+
+        return self._sub_loop_think_and_act(post_prompt, global_iteration)
+
+    def _sub_loop_think_and_act(self, prompt: str, global_iteration: int) -> Optional[Observation]:
+        """Common sub-loop: think → validate → act → remember → metrics."""
+        # 1. BUILD CONTEXT (with contamination check)
+        context = prompt
+        contam_events = self.contamination.check(context, source="sub_loop")
+        if self.contamination.should_abort(contam_events):
+            logger.warning(f"🛡️ Contamination in sub-loop prompt, skipping")
+            self._consecutive_failures += 1
+            return None
+
+        # 2. TELEMETRY — Monitor prompt
+        ctx_classification = self.telemetry_monitor.monitor_prompt(context, context="sub_loop")
+        self.audit_trail.log_prompt(context, classification=ctx_classification.to_dict(),
+                                    iteration=global_iteration + 1)
+
+        # 3. THINK
+        decision = self._think(context)
+        if not decision:
+            self._consecutive_failures += 1
+            self._backoff()
+            return None
+
+        # 4. VALIDATE
+        if not self._validate_decision(decision):
+            logger.warning(f"Invalid decision: {decision}")
+            self._consecutive_failures += 1
+            return None
+
+        # 5. ACT (with security pipeline)
+        action_name = decision.get("action", "")
+        action_input = str(decision.get("action_input", ""))
+        tool_classification = self.telemetry_monitor.monitor_tool_call(action_name, action_input)
+        self.audit_trail.log_tool_call(action_name, action_input,
+                                       classification=tool_classification.to_dict(),
+                                       iteration=global_iteration + 1)
+        observation = self._act(decision, context=context)
+
+        # 6. SANITIZE output
+        if observation.output:
+            sanitized = self.telemetry_sanitizer.sanitize_tool_output(observation.tool, observation.output)
+            if sanitized.was_modified:
+                observation.output = sanitized.sanitized
+                self.audit_trail.log_sanitization("tool_output", True,
+                                                   sanitized.threats_found, iteration=global_iteration + 1)
+
+        # 7. REMEMBER
+        self._remember(observation)
+
+        # 8. REPORT
+        self.report.log_action(
+            tool=observation.tool,
+            command=observation.command,
+            output=observation.output[:500] if observation.output else "",
+            success=observation.success,
+            duration_s=0.0,
+            flags=self._extract_flags(observation.output),
+            findings=self.plan.findings.copy() if observation.success else {},
+            phase=self.plan.state.value,
+            target=self.plan.target,
+            iteration=global_iteration + 1,
+        )
+
+        # 9. METRICS
+        self.metrics.on_tool_call(
+            tool=observation.tool,
+            command=observation.command,
+            target=self.plan.target,
+            phase=self.plan.state.value,
+            output=observation.output or "",
+            success=observation.success,
+        )
+
+        # 10. CONTEXT ENGINE
+        if observation.success and observation.output:
+            self._process_output_for_context(observation)
+
+        # 11. TRACK EFFECTIVENESS
+        self._track_effectiveness(decision, observation)
+
+        return observation
+
+    def _generic_iteration(self, global_iteration: int) -> Optional[Observation]:
+        """Fallback generic iteration when no sub-loop matches."""
+        context = self._build_context()
+        decision = self._think(context)
+        if not decision:
+            self._consecutive_failures += 1
+            self._backoff()
+            return None
+        if not self._validate_decision(decision):
+            self._consecutive_failures += 1
+            return None
+        observation = self._act(decision)
+        self._remember(observation)
+        self._update_state(decision, observation)
+        self._track_effectiveness(decision, observation)
+        return observation
+
+    def _process_output_for_context(self, obs: Observation):
+        """Feed tool output into context engine for structured extraction."""
+        output = obs.output or ""
+        if '<html' in output.lower() or '<body' in output.lower():
+            self.context_engine.process_page(output, self.plan.target)
+        if obs.tool == 'curl' and ('HTTP/' in output or 'content-type:' in output.lower()):
+            status_match = re.search(r'HTTP/[\d.]+\s+(\d{3})', output)
+            status = int(status_match.group(1)) if status_match else 0
+            self.context_engine.process_request('GET', self.plan.target, status_code=status)
+
+    def _finalize_reports(self):
+        """Save all reports at end of run."""
+        try:
+            self.report.finish()
+            json_path = self.report.save_json()
+            md_path = self.report.save_markdown()
+            logger.info(f"📝 Reports saved: {json_path}, {md_path}")
+        except Exception as e:
+            logger.error(f"Report generation failed: {e}")
+
+        try:
+            self.metrics.save_report()
+            logger.info(f"📊 Metrics: {self.metrics.get_summary()}")
+        except Exception as e:
+            logger.error(f"Metrics report failed: {e}")
 
     # ============================================================
     # CONTEXT BUILDING
@@ -512,16 +819,58 @@ Now, what is your next action? Respond with ONLY valid JSON."""
     # ACT — Execute Tool
     # ============================================================
 
-    def _act(self, decision: dict) -> Observation:
-        """Execute the decided action."""
+    def _act(self, decision: dict, context: str = "") -> Observation:
+        """Execute the decided action with full security pipeline.
+
+        Security pipeline:
+        1. Contamination check (on args)
+        2. Least privilege enforcement
+        3. Provenance tracking
+        4. Sandbox execution
+        5. Audit logging
+        6. Bifurcation (deception for detected scanners)
+        """
         action = decision.get("action", "")
         action_input = str(decision.get("action_input", ""))
+        thought = decision.get("thought", "")
+        context_hash = ProvenanceTracker.hash_context(context) if context else ""
+
+        # Set memory context to current target
+        self.memory.set_target(self.plan.target)
+
+        # ── Track E: Bifurcation check ──────────────────────────────
+        # If this agent is being scanned, serve deceptive response
+        _bif = getattr(self, 'bifurcation', None)
+        if _bif and _bif.enabled:
+            attacker_id = self._derive_scanner_id(decision)
+            if attacker_id:
+                profile = _bif.record_and_analyze(
+                    attacker_id, {"action": action, "input": action_input, "thought": thought}
+                )
+                if _bif.should_bifurcate(attacker_id, profile.bot_confidence):
+                    from .deception import _classify_scan_type
+                    scan_type = _classify_scan_type(action, action_input)
+                    fake_output = _bif.bifurcate_response(
+                        attacker_id, "", scan_type=scan_type, target=self.plan.target
+                    )
+                    logger.info(f"🎭 Bifurcation active: serving deceptive {scan_type} response")
+                    return Observation(
+                        tool=action,
+                        command=f"{action} {action_input}",
+                        output=fake_output,
+                        success=True,
+                    )
 
         if action == "submit_flag":
             return self._handle_flag_submission(action_input)
 
-        # Execute the tool
-        result = self.tools.execute(action, action_input)
+        # Execute through security pipeline
+        result = self.tools.execute(
+            action, action_input,
+            context_hash=context_hash,
+            target_id=self.plan.target,
+            thought=thought,
+        )
 
         if not result.success:
             self.run_metrics["tool_failures"] += 1
@@ -912,9 +1261,82 @@ Now, what is your next action? Respond with ONLY valid JSON."""
         logger.info(f"Tool failures: {self.run_metrics['tool_failures']}")
         logger.info(f"LLM fallbacks: {self.run_metrics['llm_fallbacks']}")
         logger.info(f"New info actions: {self.run_metrics['new_info_actions']}")
+
+        # ── Track E: Deception & Self-Test stats ─────────────────
+        _bif2 = getattr(self, 'bifurcation', None)
+        if _bif2 and _bif2.enabled:
+            dec_stats = _bif2.get_deception_stats()
+            logger.info(f"\n🎭 DECEPTION STATS:")
+            logger.info(f"  Attackers tracked: {dec_stats['total_attackers_tracked']}")
+            logger.info(f"  Bots detected: {dec_stats['total_bots_detected']}")
+            logger.info(f"  Deceptions served: {dec_stats['total_deceptions_served']}")
+            logger.info(f"  Fake flags generated: {dec_stats['total_fake_flags_generated']}")
+            logger.info(f"  Total penalty score: {dec_stats['total_penalty_score']}")
+
+        fp_stats = self.fingerprinter.get_stats()
+        logger.info(f"\n🔍 FINGERPRINT STATS:")
+        logger.info(f"  Sessions classified: {fp_stats['total_sessions_classified']}")
+        logger.info(f"  Bots detected: {fp_stats['bots_detected']}")
+
+        st_stats = self.self_test.get_stats()
+        logger.info(f"\n🧪 SELF-TEST STATS:")
+        logger.info(f"  Total tests: {st_stats['total_tests']}")
+        logger.info(f"  Blocked: {st_stats['total_blocked']}")
+        logger.info(f"  Bypasses: {st_stats['total_bypasses']}")
+        logger.info(f"  Rate: {st_stats['current_rate_per_hour']}/hour")
+        logger.info(f"  Defense effectiveness: {st_stats['defense_effectiveness']}%")
+
         for flag in self.plan.flags_found:
             submitted = "✅" if flag in self.scoreboard.submitted else "❌"
             logger.info(f"  🚩 {flag} [{submitted}]")
         logger.info(f"Findings: {json.dumps(self.plan.findings, indent=2, default=str)}")
         logger.info(f"Credentials: {json.dumps(self.plan.credentials, indent=2)}")
         logger.info("="*60)
+
+    # ============================================================
+    # TRACK E — Deception & Self-Test Helpers
+    # ============================================================
+
+    def _derive_scanner_id(self, decision: dict) -> Optional[str]:
+        """Try to derive a scanner/attacker ID from the decision context.
+
+        Returns None if this looks like a normal agent action (not a scan).
+        """
+        thought = decision.get("thought", "")
+        action = decision.get("action", "")
+        action_input = str(decision.get("action_input", ""))
+
+        # Detect if this action looks like automated scanning
+        scan_indicators = [
+            r"(?i)scan", r"(?i)probe", r"(?i)enum", r"(?i)brute",
+            r"(?i)fuzz", r"(?i)crawl", r"(?i)sweep", r"(?i)discovery",
+        ]
+        combined = f"{thought} {action} {action_input}"
+        for pattern in scan_indicators:
+            if re.search(pattern, combined):
+                return hashlib.sha256(combined[:200].encode()).hexdigest()[:16]
+        return None
+
+    def _selftest_validate(self, payload: str) -> str:
+        """Validate function for the self-test pipeline.
+
+        Tests the agent's own security barrier against injection payloads.
+        """
+        try:
+            # Use the agent's security barrier to check the payload
+            if hasattr(self.tools, 'security_barrier'):
+                is_safe, reason = self.tools.security_barrier.check_input(payload)
+                if not is_safe:
+                    return f"BLOCKED: {reason}"
+
+            # Check contamination detector
+            if hasattr(self, 'contamination'):
+                event = self.contamination.check_input(payload, source="selftest")
+                if event and event.is_contaminated:
+                    return f"BLOCKED: contamination detected — {event.pattern}"
+
+            # If no security module blocked it, simulate LLM response
+            return f"Processed: {payload[:100]}"
+
+        except Exception as e:
+            return f"ERROR: {e}"

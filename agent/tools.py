@@ -1,6 +1,9 @@
 """
 Ozz — Pentesting Tools (Competition-Grade)
 Tool wrappers with structured JSON output, timeout protection, and error handling.
+
+Security: sandbox execution, least-privilege enforcement, audit logging.
+Inspired by DEF CON 34 AI Village posters on agent-to-agent security.
 """
 
 import subprocess
@@ -10,10 +13,24 @@ import re
 import json
 import time
 import os
+import resource
+import hashlib
+import threading
 from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional, Any
 
 logger = logging.getLogger("ozz.tools")
+
+# ── Sandbox Configuration ────────────────────────────────────────────
+OZZ_WORKSPACE = os.environ.get("OZZ_WORKSPACE", "/tmp/ozz")
+CTF_NETWORK_RANGES = os.environ.get("OZZ_CTF_RANGES", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16").split(",")
+MAX_CPU_SECONDS = int(os.environ.get("OZZ_MAX_CPU_SECONDS", "300"))
+MAX_MEMORY_MB = int(os.environ.get("OZZ_MAX_MEMORY_MB", "512"))
+MAX_OUTPUT_BYTES = int(os.environ.get("OZZ_MAX_OUTPUT", "100000"))
+
+# Allowed localhost services (CTF network only)
+ALLOWED_LOCALHOST_PORTS: set[int] = set()  # Empty = no localhost access by default
+_BLOCKED_HOSTS = {"169.254.169.254", "metadata.google.internal", "instance-data"}
 
 
 @dataclass
@@ -34,8 +51,175 @@ class ToolResult:
         return json.dumps(self.to_dict(), default=str, ensure_ascii=False)
 
 
+# ── Least Privilege Enforcement ───────────────────────────────────────
+
+class LeastPrivilegePolicy:
+    """Enforces minimum scope per tool.
+
+    Each tool can only operate within its defined boundaries:
+    - nmap: only specified target ranges
+    - sqlmap: only specified URLs
+    - curl: no localhost access outside CTF network
+    - file operations: only within /tmp/ozz/ workspace
+    - No tool has unrestricted host access
+    """
+
+    def __init__(self, allowed_targets: list[str] = None):
+        self.allowed_targets = set(allowed_targets or [])
+        self._lock = threading.Lock()
+
+    def validate_target(self, target: str) -> bool:
+        """Check if a target IP/hostname is within allowed ranges."""
+        if not self.allowed_targets:
+            return True  # No restrictions if none set
+        # Check exact match or CIDR containment
+        for allowed in self.allowed_targets:
+            if target == allowed:
+                return True
+            if '/' in allowed:
+                if self._ip_in_cidr(target, allowed):
+                    return True
+            # Allow hostname suffix matching
+            if allowed.startswith('.') and target.endswith(allowed):
+                return True
+        return False
+
+    @staticmethod
+    def _ip_in_cidr(ip: str, cidr: str) -> bool:
+        """Check if IP is in CIDR range (pure Python, no deps)."""
+        try:
+            parts = cidr.split('/')
+            network = parts[0]
+            prefix = int(parts[1])
+            ip_int = sum(int(octet) << (24 - 8 * i) for i, octet in enumerate(ip.split('.')))
+            net_int = sum(int(octet) << (24 - 8 * i) for i, octet in enumerate(network.split('.')))
+            mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+            return (ip_int & mask) == (net_int & mask)
+        except (ValueError, IndexError):
+            return False
+
+    def validate_localhost_access(self, args: str) -> bool:
+        """Check if curl/wget targets are allowed (no unrestricted localhost)."""
+        # Block metadata endpoints
+        for blocked in _BLOCKED_HOSTS:
+            if blocked in args:
+                return False
+        # Block localhost unless specific ports are allowed
+        localhost_patterns = ['localhost', '127.0.0.1', '::1', '0.0.0.0']
+        for pattern in localhost_patterns:
+            if pattern in args:
+                # Extract port if present
+                port_match = re.search(r':(\d+)', args)
+                if port_match:
+                    port = int(port_match.group(1))
+                    if port not in ALLOWED_LOCALHOST_PORTS:
+                        return False
+                else:
+                    return False  # No port = unrestricted localhost = blocked
+        return True
+
+    def validate_file_path(self, path: str) -> bool:
+        """Ensure file operations stay within workspace."""
+        # Resolve to absolute path
+        abs_path = os.path.abspath(path)
+        workspace = os.path.abspath(OZZ_WORKSPACE)
+        # Allow /tmp/ozz/ and subdirectories
+        return abs_path.startswith(workspace)
+
+    def validate_nmap(self, args: str) -> tuple[bool, str]:
+        """Validate nmap arguments against allowed target ranges."""
+        # Extract targets from args
+        targets = self._extract_targets(args)
+        for target in targets:
+            if not self.validate_target(target):
+                return False, f"Target {target} not in allowed ranges: {self.allowed_targets}"
+        return True, ""
+
+    def validate_sqlmap(self, args: str) -> tuple[bool, str]:
+        """Validate sqlmap targets."""
+        url_match = re.search(r"-u\s+['\"]?(https?://[^'\"]+)", args)
+        if url_match:
+            url = url_match.group(1)
+            # Extract host from URL
+            host_match = re.search(r'https?://([^/:]+)', url)
+            if host_match:
+                host = host_match.group(1)
+                if not self.validate_target(host):
+                    return False, f"SQLMap target {host} not in allowed ranges"
+        return True, ""
+
+    def validate_curl(self, args: str) -> tuple[bool, str]:
+        """Validate curl arguments — no unrestricted localhost."""
+        if not self.validate_localhost_access(args):
+            return False, "Curl localhost access blocked (not in CTF network)"
+        return True, ""
+
+    def _extract_targets(self, args: str) -> list[str]:
+        """Extract IP addresses and hostnames from command args."""
+        # Match IP addresses
+        ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', args)
+        # Match CIDR ranges
+        cidrs = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b', args)
+        # Match hostnames (not flags)
+        hostnames = re.findall(r'\b[a-zA-Z][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b', args)
+        # Filter out common non-target strings
+        non_targets = {'nmap.org', 'exploit-db.com', 'github.com', 'example.com'}
+        hostnames = [h for h in hostnames if h not in non_targets]
+        return ips + cidrs + hostnames
+
+
+# ── Sandbox Execution ────────────────────────────────────────────────
+
+def _set_resource_limits():
+    """Set CPU and memory limits for sandboxed subprocess (called in preexec_fn)."""
+    try:
+        # CPU time limit
+        resource.setrlimit(resource.RLIMIT_CPU, (MAX_CPU_SECONDS, MAX_CPU_SECONDS))
+        # Memory limit
+        mem_bytes = MAX_MEMORY_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        # No core dumps
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        # Limit file size (100MB)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (100 * 1024 * 1024, 100 * 1024 * 1024))
+    except (ValueError, OSError):
+        pass  # Some limits may not be settable in containers
+
+
+def _sandbox_run(cmd: str, timeout: int = 120, shell: bool = True,
+                 env_override: Optional[dict] = None) -> subprocess.Popen:
+    """Execute command in sandboxed environment.
+
+    - Restricted environment variables
+    - Resource limits (CPU, memory)
+    - stdout/stderr captured separately
+    - No direct host access
+    """
+    # Minimal environment — no secrets leak
+    safe_env = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME": OZZ_WORKSPACE,
+        "TMPDIR": OZZ_WORKSPACE,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    if env_override:
+        safe_env.update(env_override)
+
+    proc = subprocess.Popen(
+        cmd,
+        shell=shell,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=safe_env,
+        preexec_fn=_set_resource_limits,
+        cwd=OZZ_WORKSPACE,
+    )
+    return proc
+
+
 class Tool:
-    """Base tool wrapper with structured output."""
+    """Base tool wrapper with structured output and provenance tracking."""
 
     def __init__(self, name: str, description: str, usage: str, handler: Callable):
         self.name = name
@@ -61,16 +245,30 @@ class Tool:
 
 
 class ToolRegistry:
-    """Registry of all available tools with structured output."""
+    """Registry of all available tools with structured output.
 
-    def __init__(self):
+    Integrates:
+    - Least privilege enforcement per tool
+    - Sandbox execution
+    - Audit logging
+    - Provenance tracking hooks
+    """
+
+    def __init__(self, allowed_targets: list[str] = None,
+                 audit_logger=None, provenance_tracker=None,
+                 contamination_detector=None):
         self.tools: dict[str, Tool] = {}
+        self.privacy_policy = LeastPrivilegePolicy(allowed_targets)
+        self.audit_logger = audit_logger
+        self.provenance_tracker = provenance_tracker
+        self.contamination_detector = contamination_detector
         self._register_defaults()
 
     def register(self, tool: Tool):
         self.tools[tool.name] = tool
 
-    def execute(self, name: str, args: str) -> ToolResult:
+    def execute(self, name: str, args: str, context_hash: str = "",
+                target_id: str = "", thought: str = "") -> ToolResult:
         if name not in self.tools:
             return ToolResult(
                 tool=name,
@@ -78,13 +276,101 @@ class ToolRegistry:
                 success=False,
                 error=f"Unknown tool: {name}. Available: {list(self.tools.keys())}",
             )
+
+        # ── Contamination check ─────────────────────────────────────
+        if self.contamination_detector:
+            events = self.contamination_detector.check(args, source=f"tool:{name}")
+            if self.contamination_detector.should_abort(events):
+                return ToolResult(
+                    tool=name,
+                    output="",
+                    success=False,
+                    error=f"CONTAMINATION_BLOCKED: Suspicious context detected in tool args: {[e.threat_type for e in events]}",
+                )
+
+        # ── Least privilege check ───────────────────────────────────
+        priv_ok, priv_err = self._check_privilege(name, args)
+        if not priv_ok:
+            logger.warning(f"🛡️ LEAST PRIVILEGE BLOCKED: {name} — {priv_err}")
+            return ToolResult(
+                tool=name,
+                output="",
+                success=False,
+                error=f"PRIVILEGE_DENIED: {priv_err}",
+            )
+
+        # ── Provenance tracking ─────────────────────────────────────
+        prov_record = None
+        if self.provenance_tracker:
+            prov_record = self.provenance_tracker.begin_record(
+                tool_name=name,
+                tool_args=args,
+                thought=thought,
+                context=context_hash,
+                target_id=target_id,
+            )
+
         logger.info(f"🔧 Executing: {name} {args}")
         result = self.tools[name].execute(args)
         logger.info(
             f"{'✅' if result.success else '❌'} {name} "
             f"({len(result.output)} chars, {result.duration_s}s)"
         )
+
+        # ── Complete provenance ─────────────────────────────────────
+        if self.provenance_tracker and prov_record:
+            self.provenance_tracker.complete_record(
+                prov_record, result.output, result.success
+            )
+
+        # ── Audit logging ───────────────────────────────────────────
+        if self.audit_logger:
+            self.audit_logger.log(
+                tool_name=name,
+                tool_args=args,
+                output=result.output,
+                success=result.success,
+                exit_code=result.exit_code,
+                duration_s=result.duration_s,
+                target_id=target_id,
+                context_hash=context_hash,
+                provenance_record_id=prov_record.record_id if prov_record else "",
+            )
+
         return result
+
+    def _check_privilege(self, name: str, args: str) -> tuple[bool, str]:
+        """Apply least-privilege rules per tool."""
+        policy = self.privacy_policy
+
+        if name == "nmap":
+            return policy.validate_nmap(args)
+        elif name == "sqlmap":
+            return policy.validate_sqlmap(args)
+        elif name in ("curl", "wget"):
+            return policy.validate_curl(args)
+        elif name in ("file", "strings", "grep", "cat"):
+            # File operations must stay in workspace
+            path_match = re.search(r'(?:^|\s)(/[\w./-]+)', args)
+            if path_match:
+                path = path_match.group(1)
+                if not policy.validate_file_path(path):
+                    return False, f"File path {path} outside workspace {OZZ_WORKSPACE}"
+            return True, ""
+        elif name == "shell":
+            # Shell commands: check for dangerous patterns
+            dangerous = ['rm -rf /', 'dd if=', 'mkfs', '> /dev/', 'chmod 777 /',
+                         'curl.*|.*sh', 'wget.*|.*sh', 'nc -e']
+            for pattern in dangerous:
+                if re.search(pattern, args):
+                    return False, f"Shell command contains blocked pattern: {pattern}"
+            # Also check localhost access
+            if not policy.validate_localhost_access(args):
+                return False, "Shell command blocked: unrestricted localhost access"
+            return True, ""
+        else:
+            # Default: allow with logging
+            return True, ""
 
     def describe_all(self) -> str:
         """Describe all tools for the LLM prompt."""
@@ -333,25 +619,38 @@ class ToolRegistry:
     def _run_cmd(
         self, cmd: str, timeout: int = 120, shell: bool = True
     ) -> ToolResult:
-        """Run a shell command with timeout and structured output."""
+        """Run a shell command in sandbox with resource limits.
+
+        Sandbox features:
+        - Restricted environment (no secrets in env)
+        - CPU and memory resource limits
+        - stdout/stderr captured separately
+        - Working directory restricted to /tmp/ozz/
+        - Output size capped
+        """
         try:
-            result = subprocess.run(
-                cmd, shell=shell, capture_output=True, text=True, timeout=timeout
-            )
-            output = result.stdout + result.stderr
-            success = result.returncode == 0 or len(result.stdout) > 0
+            proc = _sandbox_run(cmd, timeout=timeout, shell=shell)
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                return ToolResult(
+                    output="",
+                    success=False,
+                    error=f"TIMEOUT: Command exceeded {timeout}s limit (sandbox killed)",
+                    exit_code=-9,
+                )
+
+            stdout_str = stdout.decode("utf-8", errors="replace")[:MAX_OUTPUT_BYTES]
+            stderr_str = stderr.decode("utf-8", errors="replace")[:MAX_OUTPUT_BYTES]
+            output = stdout_str + stderr_str
+            success = proc.returncode == 0 or len(stdout_str) > 0
             return ToolResult(
                 output=output[:10000],
                 success=success,
-                exit_code=result.returncode,
-                error=result.stderr.strip() if result.returncode != 0 else None,
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                output="",
-                success=False,
-                error=f"TIMEOUT: Command exceeded {timeout}s limit",
-                exit_code=-9,
+                exit_code=proc.returncode,
+                error=stderr_str.strip() if proc.returncode != 0 else None,
             )
         except FileNotFoundError as e:
             return ToolResult(
