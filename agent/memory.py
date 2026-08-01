@@ -4,6 +4,7 @@ SQLite-based working memory for the agent.
 """
 
 import json
+import os
 import sqlite3
 import time
 import logging
@@ -12,7 +13,7 @@ from typing import Optional
 
 logger = logging.getLogger("ozz.memory")
 
-DB_PATH = "/tmp/ozz_memory.db"
+DB_PATH = os.environ.get("OZZ_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".openclaw", "tmp", "ozz_memory.db"))
 
 
 class Memory:
@@ -24,6 +25,7 @@ class Memory:
 
     def _init_db(self):
         """Initialize the database schema."""
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
 
@@ -99,18 +101,33 @@ class Memory:
             )
         """)
 
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS tournaments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL,
+                domain TEXT,
+                target TEXT,
+                winner_id TEXT,
+                winner_name TEXT,
+                rounds_executed INTEGER,
+                debate_summary TEXT,
+                ranked_json TEXT,
+                history_json TEXT
+            )
+        """)
+
         conn.commit()
         conn.close()
         logger.info(f"Memory initialized at {self.db_path}")
 
-    def store(self, observation):
-        """Store an observation."""
+    def store(self, observation, target: str = "", phase: str = ""):
+        """Store an observation with target and phase."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute(
-            "INSERT INTO observations (timestamp, tool, command, output, success) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO observations (timestamp, tool, command, output, success, target, phase) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (observation.timestamp, observation.tool, observation.command,
-             observation.output, observation.success)
+             observation.output, observation.success, target, phase)
         )
         conn.commit()
         conn.close()
@@ -131,16 +148,23 @@ class Memory:
         conn.close()
 
     def store_flag(self, flag: str, source: str = "", target: str = ""):
-        """Store a found flag."""
+        """Store a found flag (idempotent — same flag+target won't duplicate)."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute(
-            "INSERT INTO flags (timestamp, flag, source, target) VALUES (?, ?, ?, ?)",
-            (time.time(), flag, source, target)
+            "SELECT id FROM flags WHERE flag = ? AND target = ?",
+            (flag, target)
         )
+        if c.fetchone() is None:
+            c.execute(
+                "INSERT INTO flags (timestamp, flag, source, target) VALUES (?, ?, ?, ?)",
+                (time.time(), flag, source, target)
+            )
+            logger.info(f"🚩 Flag stored: {flag}")
+        else:
+            logger.info(f"🚩 Flag already stored (idempotent skip): {flag}")
         conn.commit()
         conn.close()
-        logger.info(f"🚩 Flag stored: {flag}")
 
     def store_credential(self, username: str, password: str = "", hash_value: str = "",
                         service: str = "", target: str = "", source: str = ""):
@@ -286,13 +310,77 @@ class Memory:
         conn.close()
         return results
 
+    def store_tournament_result(self, domain: str, target: str, result) -> None:
+        """Store a tournament result (TournamentResult or compatible object)."""
+        import json as _json
+        winner = result.winner
+        ranked = result.ranked_hypotheses
+        ranked_data = [
+            {"id": h.id, "name": h.name, "rating": h.rating}
+            for h in ranked
+        ]
+        history_data = getattr(result, "history", [])
+
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO tournaments "
+            "(timestamp, domain, target, winner_id, winner_name, rounds_executed, debate_summary, ranked_json, history_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                time.time(),
+                domain,
+                target,
+                winner.id,
+                winner.name,
+                result.rounds_executed,
+                result.debate_summary,
+                _json.dumps(ranked_data),
+                _json.dumps(history_data),
+            )
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"🏆 Tournament stored: domain={domain}, winner={winner.name}")
+
+    def get_tournament_history(self, domain: str = "", limit: int = 100) -> list[dict]:
+        """Retrieve tournament history, optionally filtered by domain."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        query = "SELECT domain, target, winner_id, winner_name, rounds_executed, debate_summary, ranked_json, history_json FROM tournaments WHERE 1=1"
+        params: list = []
+        if domain:
+            query += " AND domain = ?"
+            params.append(domain)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        c.execute(query, params)
+        rows = c.fetchall()
+        conn.close()
+
+        results = []
+        for row in rows:
+            results.append({
+                "domain": row[0],
+                "target": row[1],
+                "winner_id": row[2],
+                "winner_name": row[3],
+                "rounds_executed": row[4],
+                "debate_summary": row[5],
+                "ranked_json": row[6],
+                "history_json": row[7],
+            })
+        return results
+
     def get_stats(self) -> dict:
         """Get memory statistics."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
 
         stats = {}
-        for table in ["observations", "findings", "flags", "credentials", "run_metrics"]:
+        for table in ["observations", "findings", "flags", "credentials", "run_metrics", "tournaments"]:
             c.execute(f"SELECT COUNT(*) FROM {table}")
             stats[table] = c.fetchone()[0]
 

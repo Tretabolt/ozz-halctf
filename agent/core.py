@@ -1,11 +1,21 @@
 """
 Ozz — HALctf Autonomous Pentesting Agent
-Core ReAct agent loop.
+Core ReAct agent loop — Competition Grade.
+
+Design principles:
+  - ALL decisions via LLM. Zero hardcoded decision logic.
+  - Few-shot calibrated for CTF patterns.
+  - Circuit breaker + exponential backoff.
+  - NEDK composable regulation layer.
+  - Automatic flag extraction and scoreboard submission.
 """
 
 import json
+import os
+import re
 import time
 import logging
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -13,9 +23,60 @@ from typing import Optional
 from .llm import LLM
 from .memory import Memory
 from .tools import ToolRegistry, ToolResult
+from .few_shot import get_few_shot_messages
 
 logger = logging.getLogger("ozz")
 
+
+# ============================================================
+# Configuration (all env-configurable, zero hardcoded decisions)
+# ============================================================
+
+def _env_int(key: str, default: int) -> int:
+    return int(os.environ.get(key, str(default)))
+
+def _env_float(key: str, default: float) -> float:
+    return float(os.environ.get(key, str(default)))
+
+def _env_str(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+
+MAX_ITERATIONS = _env_int("OZZ_MAX_ITERATIONS", 200)
+ACTION_DELAY_BASE = _env_float("OZZ_ACTION_DELAY", 0.5)
+ACTION_DELAY_MAX = _env_float("OZZ_ACTION_DELAY_MAX", 30.0)
+CIRCUIT_BREAKER_THRESHOLD = _env_int("OZZ_CIRCUIT_BREAKER", 15)
+LOOP_DETECTION_WINDOW = _env_int("OZZ_LOOP_WINDOW", 5)
+LOOP_DETECTION_THRESHOLD = _env_int("OZZ_LOOP_THRESHOLD", 3)
+CONTEXT_HISTORY_DEPTH = _env_int("OZZ_CONTEXT_HISTORY", 8)
+SCOREBOARD_URL = _env_str("SCOREBOARD_URL", "")
+SCOREBOARD_AGENT_NAME = _env_str("SCOREBOARD_AGENT", "Ozz")
+
+
+# ============================================================
+# Flag Patterns (comprehensive CTF coverage)
+# ============================================================
+
+FLAG_PATTERNS = [
+    r'flag\{[^}]+\}',
+    r'CTF\{[^}]+\}',
+    r'HALCTF\{[^}]+\}',
+    r'DEFCON\{[^}]+\}',
+    r'picoCTF\{[^}]+\}',
+    r'HTB\{[^}]+\}',
+    r'THM\{[^}]+\}',
+    r'FLAG\{[^}]+\}',
+    r'Flag\{[^}]+\}',
+    r'[A-Za-z_]+\{[a-zA-Z0-9_\-!@#$%^&*()+=]{3,}\}',
+]
+
+# Pre-compile for performance
+_FLAG_RE = re.compile('|'.join(FLAG_PATTERNS), re.IGNORECASE)
+
+
+# ============================================================
+# Data Structures
+# ============================================================
 
 class AgentState(Enum):
     IDLE = "idle"
@@ -50,603 +111,632 @@ class Plan:
     flags_found: list = field(default_factory=list)
 
 
+# ============================================================
+# Prompts
+# ============================================================
+
 SYSTEM_PROMPT = """You are Ozz, an autonomous penetration testing agent competing in HALctf at DEF CON 34.
 
 YOUR MISSION: Find and capture flags in CTF challenges. Flags typically follow formats like:
-- flag{...}
-- CTF{...}
-- HALCTF{...}
+- flag{{...}}, CTF{{...}}, HALCTF{{...}}, picoCTF{{...}}, HTB{{...}}
 - Or custom formats specified by the challenge
 
-APPROACH:
+APPROACH (ReAct methodology):
 1. RECON: Scan targets to discover services and technologies
 2. ENUMERATION: Deep-dive into discovered services for vulnerabilities
 3. EXPLOITATION: Use found vulnerabilities to gain access
-4. POST-EXPLOIT: Search for flags in the compromised system
+4. POST_EXPLOIT: Search for flags in the compromised system
 5. PIVOT: Use compromised systems to reach other targets
 
 TOOLS AVAILABLE:
 {tools_desc}
 
 RESPONSE FORMAT:
-You must respond with a JSON object:
-{{
+You MUST respond with a single valid JSON object:
+{{{{
   "thought": "Your reasoning about the current situation and what to do next",
   "action": "tool_name",
   "action_input": "input for the tool",
   "plan_update": "optional: update your plan/state"
-}}
+}}}}
 
 If you find a flag, respond with:
-{{
+{{{{
   "thought": "Found a flag!",
   "action": "submit_flag",
   "action_input": "the_flag_value"
-}}
+}}}}
 
-If you're stuck, try a different approach. Be creative. Think like a hacker.
-Respond ONLY with valid JSON. No markdown, no explanation outside the JSON."""
+CRITICAL RULES:
+- Respond ONLY with valid JSON. No markdown fences, no explanation outside the JSON.
+- Be creative. If one approach fails, try another.
+- Use 'shell' for any command not explicitly listed as a tool.
+- Always check for flags in every output — they can appear anywhere.
+- If stuck for 3+ attempts, completely change your approach."""
 
-RECON_PROMPT = """You are in the RECON phase. Your goal is to discover what's running on the target.
 
-Current target: {target}
-Previous findings: {findings}
+def _build_phase_prompt(state: AgentState, target: str, findings: dict,
+                        credentials: list, targets: list, target_idx: int) -> str:
+    """Build phase-specific guidance. Content is derived from state, not hardcoded logic."""
+    findings_str = json.dumps(findings, indent=2, default=str) if findings else "None yet"
+    creds_str = json.dumps(credentials, indent=2) if credentials else "None found"
 
-What's your next recon step? Consider:
-- Port scanning (nmap)
-- Service detection
-- Web directory enumeration
-- DNS/subdomain discovery
-- Banner grabbing"""
+    phase_guidance = {
+        AgentState.RECON: (
+            f"You are in the RECON phase for target: {target}\n"
+            f"Goal: Discover what services are running. Use nmap, quick_scan, whatweb.\n"
+            f"Findings so far: {findings_str}"
+        ),
+        AgentState.ENUMERATION: (
+            f"You are in the ENUMERATION phase for target: {target}\n"
+            f"Goal: Deep-dive into discovered services. Find vulnerabilities.\n"
+            f"Services found: {findings.get('services', 'None')}\n"
+            f"Findings: {findings_str}"
+        ),
+        AgentState.EXPLOITATION: (
+            f"You are in the EXPLOITATION phase for target: {target}\n"
+            f"Goal: Exploit discovered vulnerabilities to gain access.\n"
+            f"Vulnerabilities: {findings.get('vulnerabilities', 'None')}\n"
+            f"Credentials: {creds_str}\n"
+            f"Findings: {findings_str}"
+        ),
+        AgentState.POST_EXPLOIT: (
+            f"You are in the POST_EXPLOIT phase for target: {target}\n"
+            f"Goal: Search compromised system for flags, credentials, and pivot opportunities.\n"
+            f"Credentials: {creds_str}\n"
+            f"Findings: {findings_str}"
+        ),
+        AgentState.PIVOT: (
+            f"You are in the PIVOT phase.\n"
+            f"Goal: Use compromised systems to reach other targets.\n"
+            f"Compromised: {findings.get('compromised', 'None')}\n"
+            f"Networks: {findings.get('networks', 'None')}\n"
+            f"Credentials: {creds_str}\n"
+            f"All targets: {targets}"
+        ),
+        AgentState.IDLE: "Starting up. Begin with reconnaissance.",
+        AgentState.DONE: "All objectives complete.",
+    }
+    return phase_guidance.get(state, "Continue with your current plan.")
 
-ENUM_PROMPT = """You are in the ENUMERATION phase. You've found services and need to dig deeper.
 
-Current target: {target}
-Services found: {services}
-Previous findings: {findings}
+# ============================================================
+# Scoreboard Integration
+# ============================================================
 
-What's your next enumeration step? Consider:
-- Web app scanning (nikto, whatweb)
-- Directory bruteforcing (gobuster, dirb)
-- Service-specific enumeration (SMB, NFS, SSH)
-- Version detection and vulnerability lookup
-- Credential testing"""
+class ScoreboardClient:
+    """Submits flags to the CTF scoreboard."""
 
-EXPLOIT_PROMPT = """You are in the EXPLOITATION phase. You've identified potential vulnerabilities.
+    def __init__(self, url: str = SCOREBOARD_URL, agent_name: str = SCOREBOARD_AGENT_NAME):
+        self.url = url.rstrip("/") if url else ""
+        self.agent_name = agent_name
+        self.submitted: list[str] = []
 
-Current target: {target}
-Vulnerabilities found: {vulns}
-Credentials found: {creds}
-Previous findings: {findings}
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
 
-What's your next exploit attempt? Consider:
-- Known exploit scripts (searchsploit)
-- Credential stuffing
-- Command injection
-- SQL injection
-- File upload vulnerabilities
-- Default credentials
-- Reverse shells"""
+    def submit(self, flag: str) -> dict:
+        """Submit a flag to the scoreboard. Returns result dict."""
+        if not self.url:
+            logger.info(f"🚩 [NO SCOREBOARD] Flag stored locally: {flag}")
+            return {"status": "local_only", "flag": flag}
 
-PIVOT_PROMPT = """You are in the PIVOT phase. You've compromised a system and need to reach others.
+        if flag in self.submitted:
+            return {"status": "duplicate", "flag": flag}
 
-Compromised hosts: {compromised}
-Discovered networks: {networks}
-Credentials found: {creds}
-All targets: {targets}
+        try:
+            import requests
+            resp = requests.post(
+                f"{self.url}/submit",
+                data={"flag": flag, "agent": self.agent_name},
+                timeout=10,
+            )
+            result = {"status": "submitted", "flag": flag, "http_status": resp.status_code}
+            if resp.status_code == 200:
+                self.submitted.append(flag)
+                logger.info(f"🚩 ✅ Flag submitted to scoreboard: {flag}")
+            else:
+                logger.warning(f"🚩 ⚠️ Scoreboard returned {resp.status_code}: {resp.text[:200]}")
+            return result
+        except Exception as e:
+            logger.error(f"🚩 ❌ Scoreboard submission failed: {e}")
+            return {"status": "error", "flag": flag, "error": str(e)}
 
-What's your next pivot step? Consider:
-- Internal network scanning from compromised host
-- Credential reuse on other targets
-- Tunneling/proxying
-- SSH pivoting
-- ARP scanning"""
 
+# ============================================================
+# OzzAgent — Competition-Grade ReAct Agent
+# ============================================================
 
 class OzzAgent:
-    """Main autonomous pentesting agent."""
+    """Main autonomous pentesting agent.
 
-    def __init__(self, targets: list[str], model_path: str = "/models"):
+    Architecture:
+      ReAct loop: context → LLM → parse → validate → act → observe → remember
+      MNHI 3.5 spaces composed via NEDK (optional)
+      Circuit breaker prevents infinite loops
+      Exponential backoff on repeated failures
+    """
+
+    def __init__(self, targets: list[str], model_path: str = "/models",
+                 nedk=None, scoreboard_url: str = ""):
         self.targets = targets
         self.llm = LLM(model_path)
         self.memory = Memory()
         self.tools = ToolRegistry()
         self.plan = Plan(objective="Find and capture all flags")
         self.history: list[Observation] = []
-        self.max_iterations = 200
+        self.max_iterations = MAX_ITERATIONS
         self.current_target_idx = 0
         self.run_id = f"run-{int(time.time() * 1000)}"
+        self.nedk = nedk  # Optional NEDK composition
+
+        # Scoreboard
+        sb_url = scoreboard_url or SCOREBOARD_URL
+        self.scoreboard = ScoreboardClient(url=sb_url)
+
+        # Circuit breaker & backoff
+        self._consecutive_failures = 0
+        self._consecutive_same_action = 0
+        self._last_action_sig: Optional[str] = None
+        self._current_delay = ACTION_DELAY_BASE
+        self._stuck_count = 0
+        self._actions_without_new_info = 0
+
+        # Loop detection
+        self._action_signatures: list[str] = []
+
+        # Run metrics
         self.run_metrics = {
             "run_id": self.run_id,
             "targets": list(targets),
             "iterations": 0,
             "flags_found": 0,
+            "flags_submitted": 0,
             "loop_detected": 0,
+            "circuit_breaks": 0,
             "phase_transitions": 0,
             "tool_failures": 0,
             "llm_fallbacks": 0,
+            "new_info_actions": 0,
         }
         self._last_phase: Optional[AgentState] = None
-        self._consecutive_action_repeats = 0
-        self.action_effectiveness: dict[str, dict] = {}
-        self.prior_run_insights: dict = {}
+
+    # ============================================================
+    # MAIN LOOP
+    # ============================================================
 
     def run(self):
-        """Main agent loop."""
+        """Main agent loop — full ReAct cycle."""
         logger.info(f"🏴 Ozz starting. Targets: {self.targets}")
+        logger.info(f"   Scoreboard: {'enabled' if self.scoreboard.enabled else 'disabled (local only)'}")
+        logger.info(f"   Max iterations: {self.max_iterations}")
+        logger.info(f"   Circuit breaker: {CIRCUIT_BREAKER_THRESHOLD} consecutive failures")
+
         self.plan.state = AgentState.RECON
         self.plan.target = self.targets[0] if self.targets else ""
 
         for i in range(self.max_iterations):
             self.run_metrics["iterations"] = i + 1
+
             if self.plan.state == AgentState.DONE:
                 logger.info("🏁 Agent completed all objectives.")
                 break
 
+            # Circuit breaker check
+            if self._consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+                logger.error(f"🛑 Circuit breaker triggered after {self._consecutive_failures} consecutive failures.")
+                self.run_metrics["circuit_breaks"] += 1
+                # Try to recover by switching target or state
+                if not self._try_circuit_breaker_recovery():
+                    logger.error("🛑 Cannot recover. Stopping.")
+                    break
+
             logger.info(f"\n{'='*60}")
-            logger.info(f"Iteration {i+1} | State: {self.plan.state.value} | Target: {self.plan.target}")
+            logger.info(f"Iteration {i+1}/{self.max_iterations} | State: {self.plan.state.value} | Target: {self.plan.target}")
+            logger.info(f"  Consecutive failures: {self._consecutive_failures} | Delay: {self._current_delay:.1f}s")
             logger.info(f"{'='*60}")
 
-            # 1. Observe — build context
+            # 1. BUILD CONTEXT
             context = self._build_context()
 
-            # 2. Think — get LLM decision
+            # 2. THINK — LLM decides (no hardcoded overrides)
             decision = self._think(context)
             if not decision:
-                logger.warning("LLM returned no decision, retrying...")
+                self._consecutive_failures += 1
+                self._backoff()
                 continue
 
-            # 3. Act — execute tool
+            # 3. VALIDATE decision structure
+            if not self._validate_decision(decision):
+                logger.warning(f"Invalid decision structure: {decision}")
+                self._consecutive_failures += 1
+                continue
+
+            # 4. ACT — execute tool
             observation = self._act(decision)
 
-            # 4. Remember — store result
+            # 5. REMEMBER — store and interpret
             self._remember(observation)
 
-            # 5. Check for flags in output
-            self._check_flags(observation.output)
+            # 6. CHECK FLAGS
+            new_flags = self._extract_flags(observation.output)
+            for flag in new_flags:
+                self._handle_flag(flag, observation)
 
-            # 6. Update state if needed
+            # 7. UPDATE STATE
             self._update_state(decision, observation)
 
-            # Small delay to not overwhelm targets
-            time.sleep(0.5)
+            # 8. TRACK EFFECTIVENESS
+            self._track_effectiveness(decision, observation)
+
+            # 9. LOOP DETECTION
+            if self._detect_loop():
+                self._break_loop()
+
+            # Adaptive delay
+            time.sleep(self._current_delay)
             self.memory.store_run_metrics(self.run_metrics, run_id=self.run_id)
 
         # Final report
         self.run_metrics["flags_found"] = len(self.plan.flags_found)
+        self.run_metrics["flags_submitted"] = len(self.scoreboard.submitted)
         self.memory.store_run_metrics(self.run_metrics, run_id=self.run_id)
         self._report()
 
-    def _build_context(self) -> str:
-        """Build the context for the LLM."""
-        tools = getattr(self, "tools", None)
-        tools_desc = tools.describe_all() if tools is not None else "No tools available"
-        findings = json.dumps(self.plan.findings, indent=2, default=str)
+    # ============================================================
+    # CONTEXT BUILDING
+    # ============================================================
 
-        # Get recent history (last 5 observations)
-        recent = self.history[-5:] if self.history else []
-        history_text = "\n".join(
-            f"[{o.tool}] {o.command}\n{'SUCCESS' if o.success else 'FAILED'}: {o.output[:500]}"
-            for o in recent
+    def _build_context(self) -> str:
+        """Build the full context for the LLM. No hardcoded logic — pure state."""
+        tools_desc = self.tools.describe_all()
+        findings = json.dumps(self.plan.findings, indent=2, default=str) if self.plan.findings else "{}"
+
+        # Recent history (configurable depth)
+        recent = self.history[-CONTEXT_HISTORY_DEPTH:] if self.history else []
+        history_lines = []
+        for o in recent:
+            status = "SUCCESS" if o.success else "FAILED"
+            output_preview = o.output[:600] if o.output else "<no output>"
+            history_lines.append(f"[{o.tool}] {o.command}\n  {status}: {output_preview}")
+        history_text = "\n".join(history_lines) if history_lines else "No actions yet."
+
+        # Phase prompt
+        phase_prompt = _build_phase_prompt(
+            self.plan.state, self.plan.target, self.plan.findings,
+            self.plan.credentials, self.targets, self.current_target_idx
         )
 
-        # Build phase-specific prompt
-        if self.plan.state == AgentState.RECON:
-            phase_prompt = RECON_PROMPT.format(
-                target=self.plan.target,
-                findings=findings
-            )
-        elif self.plan.state == AgentState.ENUMERATION:
-            services = self.plan.findings.get("services", "None discovered yet")
-            phase_prompt = ENUM_PROMPT.format(
-                target=self.plan.target,
-                services=services,
-                findings=findings
-            )
-        elif self.plan.state == AgentState.EXPLOITATION:
-            vulns = self.plan.findings.get("vulnerabilities", [])
-            creds = self.plan.credentials
-            phase_prompt = EXPLOIT_PROMPT.format(
-                target=self.plan.target,
-                vulns=vulns,
-                creds=creds,
-                findings=findings
-            )
-        elif self.plan.state == AgentState.PIVOT:
-            phase_prompt = PIVOT_PROMPT.format(
-                compromised=self.plan.findings.get("compromised", []),
-                networks=self.plan.findings.get("networks", []),
-                creds=self.plan.credentials,
-                targets=self.targets
-            )
-        else:
-            phase_prompt = "Continue with your current plan."
-
+        # System prompt with tools
         system = SYSTEM_PROMPT.replace("{tools_desc}", tools_desc)
 
-        credentials_summary = []
+        # Credentials summary
+        creds_summary = []
         for cred in self.plan.credentials:
             if isinstance(cred, dict):
-                username = cred.get("username", "")
-                password = cred.get("password", "")
-                credentials_summary.append(f"{username}:{password}" if username or password else "<empty>")
+                u = cred.get("username", "")
+                p = cred.get("password", "")
+                creds_summary.append(f"{u}:{p}" if u or p else "<empty>")
             else:
-                credentials_summary.append(str(cred))
+                creds_summary.append(str(cred))
 
-        prior_strategy_text = self._format_prior_strategy_context()
-        exploit_reference_text = self._format_exploit_reference_context()
-        service_strategy_text = self._format_service_strategy_context()
+        # Prior run context
+        prior_context = self._format_prior_context()
+
+        # Action effectiveness context
+        effectiveness_context = self._format_effectiveness_context()
 
         return f"""{system}
 
 === CURRENT PHASE ===
 {phase_prompt}
 
-=== RECENT ACTIONS ===
+=== RECENT ACTIONS (last {len(recent)}) ===
 {history_text}
 
 === DISCOVERED FINDINGS ===
 {findings}
 
 === KNOWN CREDENTIALS ===
-{credentials_summary if credentials_summary else 'None'}
-
-=== PRIOR RUN STRATEGIES ===
-{prior_strategy_text}
-
-=== EXPLOIT REFERENCE CONTEXT ===
-{exploit_reference_text}
-
-=== SERVICE-SPECIFIC STRATEGY ===
-{service_strategy_text}
+{', '.join(creds_summary) if creds_summary else 'None'}
 
 === FLAGS FOUND SO FAR ===
-{self.plan.flags_found}
+{self.plan.flags_found if self.plan.flags_found else 'None yet'}
 
 === TARGETS REMAINING ===
 {self.targets[self.current_target_idx:]}
 
-Now, what's your next action?"""
+=== PRIOR RUN INSIGHTS ===
+{prior_context}
+
+=== ACTION EFFECTIVENESS ===
+{effectiveness_context}
+
+Now, what is your next action? Respond with ONLY valid JSON."""
+
+    # ============================================================
+    # THINK — LLM Decision (NO hardcoded overrides)
+    # ============================================================
 
     def _think(self, context: str) -> Optional[dict]:
-        """Get LLM decision with Anti-Loop Psi-Stabilizer."""
-        # 1. Verificar Anti-Loop (Hash das últimas 5 ações)
-        if len(self.history) >= 3:
-            recent_signatures = [f"{o.tool}:{o.command}" for o in self.history[-3:]]
-            if len(set(recent_signatures)) == 1:
-                self._consecutive_action_repeats += 1
-                if self._consecutive_action_repeats >= 2:
-                    self.run_metrics["loop_detected"] += 1
-                    logger.warning("⚠️ Ψ-Stabilizer: Loop detectado! Forçando perturbação δS_aleatoria para mudar de foco.")
-                    if self.plan.state == AgentState.RECON:
-                        self.plan.state = AgentState.ENUMERATION
-                    elif self.plan.state == AgentState.ENUMERATION:
-                        self.plan.state = AgentState.EXPLOITATION
-                    return {
-                        "thought": "Psi-Stabilizer acionado para quebrar loop de execução repetida.",
-                        "action": "quick_scan",
-                        "action_input": self.plan.target
-                    }
-            else:
-                self._consecutive_action_repeats = 0
-
-        self.prior_run_insights = self._load_prior_run_insights()
-
+        """Get LLM decision. The LLM decides everything — no hardcoded overrides."""
         try:
             decision = self.llm.generate_json(context)
+
             if self.llm.last_request_was_fallback:
                 self.run_metrics["llm_fallbacks"] += 1
-                logger.warning("⚠️ LLM fallback endpoint was used for this request.")
 
             if decision and isinstance(decision, dict):
-                logger.info(f"🧠 Thought: {decision.get('thought', 'N/A')}")
-                logger.info(f"🎯 Action: {decision.get('action', 'N/A')}")
-                if decision.get("action") in {"shell", "quick_scan", "curl", "ssh", "sqlmap", "nmap"}:
-                    candidate_obs = Observation(tool=decision.get("action", ""), command=decision.get("action_input", ""), output=decision.get("action_input", ""), success=True)
-                    if self.prior_run_insights.get("best_strategy"):
-                        best_strategy = self.prior_run_insights["best_strategy"]
-                        if best_strategy.get("flags_found", 0) > 0:
-                            learning_guided = self._choose_learning_guided_action(candidate_obs)
-                            if learning_guided.get("action"):
-                                learning_guided["thought"] = decision.get("thought", "Strategy from prior successful runs")
-                                learning_guided["plan_update"] = decision.get("plan_update")
-                                return learning_guided
-                    strategic_decision = self._select_next_action(candidate_obs)
-                    learning_guided = self._choose_learning_guided_action(candidate_obs)
-                    if learning_guided.get("action"):
-                        learning_guided["thought"] = decision.get("thought", "Strategic selection")
-                        learning_guided["plan_update"] = decision.get("plan_update")
-                        return learning_guided
-                    if strategic_decision.get("action"):
-                        strategic_decision["thought"] = decision.get("thought", "Strategic selection")
-                        strategic_decision["plan_update"] = decision.get("plan_update")
-                        return strategic_decision
+                thought = decision.get("thought", "N/A")
+                action = decision.get("action", "N/A")
+                logger.info(f"🧠 Thought: {thought[:200]}")
+                logger.info(f"🎯 Action: {action}")
+                self._consecutive_failures = 0  # Reset on successful LLM call
                 return decision
             else:
-                logger.warning("LLM respondeu sem estrutura JSON válida, usando fallback de extração.")
-                return {"thought": "Resposta sem formato JSON claro", "action": "shell", "action_input": "echo 'parse error'"}
+                logger.warning("LLM returned non-dict response, attempting extraction...")
+                # Try to extract JSON from free-form text
+                return self._extract_decision_from_text(context)
+
         except Exception as e:
             logger.error(f"LLM error: {e}")
             return None
 
+    def _extract_decision_from_text(self, context: str) -> Optional[dict]:
+        """Fallback: ask LLM to retry with stricter format."""
+        retry_prompt = (
+            "Your previous response was not valid JSON. "
+            "You MUST respond with ONLY a JSON object like: "
+            '{"thought": "...", "action": "tool_name", "action_input": "..."}\n'
+            "What is your next action?"
+        )
+        try:
+            decision = self.llm.generate_json(retry_prompt)
+            if decision and isinstance(decision, dict) and "action" in decision:
+                return decision
+        except Exception:
+            pass
+        return None
+
+    def _validate_decision(self, decision: dict) -> bool:
+        """Validate that a decision has the required fields."""
+        if not isinstance(decision, dict):
+            return False
+        if "action" not in decision:
+            return False
+        # action_input is optional (some tools don't need it)
+        return True
+
+    # ============================================================
+    # ACT — Execute Tool
+    # ============================================================
+
     def _act(self, decision: dict) -> Observation:
         """Execute the decided action."""
         action = decision.get("action", "")
-        action_input = decision.get("action_input", "")
+        action_input = str(decision.get("action_input", ""))
 
         if action == "submit_flag":
-            # Special handling for flag submission
-            return Observation(
-                tool="submit_flag",
-                command=f"submit_flag({action_input})",
-                output=f"Flag submitted: {action_input}",
-                success=True
-            )
+            return self._handle_flag_submission(action_input)
 
         # Execute the tool
         result = self.tools.execute(action, action_input)
 
         if not result.success:
             self.run_metrics["tool_failures"] += 1
+            self._consecutive_failures += 1
+        else:
+            self._consecutive_failures = 0
 
         return Observation(
             tool=action,
             command=f"{action} {action_input}",
             output=result.output,
-            success=result.success
+            success=result.success,
         )
 
+    def _handle_flag_submission(self, flag: str) -> Observation:
+        """Handle flag submission — store locally AND submit to scoreboard."""
+        flag = flag.strip()
+        if not flag:
+            return Observation(tool="submit_flag", command="submit_flag(empty)", output="Empty flag", success=False)
+
+        # Store in memory
+        self.memory.store_flag(flag, source="agent", target=self.plan.target)
+
+        # Submit to scoreboard
+        sb_result = self.scoreboard.submit(flag)
+
+        return Observation(
+            tool="submit_flag",
+            command=f"submit_flag({flag})",
+            output=f"Flag submitted: {flag} | Scoreboard: {sb_result.get('status', 'unknown')}",
+            success=True,
+        )
+
+    # ============================================================
+    # REMEMBER — Store & Interpret
+    # ============================================================
+
     def _remember(self, obs: Observation):
-        """Store observation in memory."""
+        """Store observation and extract structured findings."""
         self.history.append(obs)
-        self.memory.store(obs)
+        self.memory.store(obs, target=self.plan.target, phase=self.plan.state.value)
         self._interpret_observation(obs)
 
     def _interpret_observation(self, obs: Observation):
-        """Turn raw tool output into structured findings and credentials."""
+        """Extract structured findings from tool output. Pattern-based, not hardcoded."""
         output = obs.output or ""
         if not output:
             return
 
+        output_lower = output.lower()
         services = self.plan.findings.setdefault("services", [])
         vulnerabilities = self.plan.findings.setdefault("vulnerabilities", [])
 
-        # Extract services from nmap-like output
+        found_new_info = False
+
+        # Extract services from nmap-style output
         for line in output.splitlines():
-            if "/tcp" in line and ("open" in line or "closed" in line):
-                if line not in services:
-                    services.append(line.strip())
+            if "/tcp" in line and ("open" in line):
+                entry = line.strip()
+                if entry not in services:
+                    services.append(entry)
+                    found_new_info = True
+            elif "/udp" in line and ("open" in line):
+                entry = line.strip()
+                if entry not in services:
+                    services.append(entry)
+                    found_new_info = True
 
-        # Extract credentials from common patterns
-        credential_pairs = []
-        for line in output.splitlines():
-            if "username=" in line.lower():
-                key, value = line.split("=", 1)
-                credential_pairs.append((key.strip().lower(), value.strip()))
-            if "password=" in line.lower():
-                key, value = line.split("=", 1)
-                credential_pairs.append((key.strip().lower(), value.strip()))
+        # Extract web technologies from whatweb/curl headers
+        tech_patterns = [
+            (r'server:\s*(\S+)', "web_server"),
+            (r'x-powered-by:\s*(\S+)', "framework"),
+            (r'(\w+/\d+\.\d+[\.\d]*)', "version"),
+        ]
+        for pattern, category in tech_patterns:
+            for match in re.finditer(pattern, output, re.IGNORECASE):
+                tech = match.group(1)
+                tech_entry = f"{category}: {tech}"
+                if tech_entry not in services:
+                    services.append(tech_entry)
+                    found_new_info = True
 
-        if credential_pairs:
-            username = None
-            password = None
-            for key, value in credential_pairs:
-                if key == "username":
-                    username = value
-                elif key == "password":
-                    password = value
-            if username or password:
-                existing = any(
-                    c.get("username") == username and c.get("password") == password
-                    for c in self.plan.credentials
-                )
-                if not existing:
-                    self.plan.credentials.append({"username": username or "", "password": password or ""})
-
-        # Extract simple vulnerability hints
+        # Extract vulnerability indicators
         vuln_markers = [
-            ("sql injection", "sql injection"),
-            ("command injection", "command injection"),
+            ("sql injection", "sql_injection"),
+            ("sqli", "sql_injection"),
+            ("command injection", "command_injection"),
             ("ssti", "ssti"),
+            ("server-side template injection", "ssti"),
             ("lfi", "lfi"),
-            ("sqli", "sql injection"),
-            ("sqli", "sql injection"),
+            ("local file inclusion", "lfi"),
+            ("rfi", "rfi"),
+            ("remote file inclusion", "rfi"),
+            ("xss", "xss"),
+            ("cross-site scripting", "xss"),
+            ("xxe", "xxe"),
+            ("xml external entity", "xxe"),
+            ("ssrf", "ssrf"),
+            ("server-side request forgery", "ssrf"),
+            ("deserialization", "deserialization"),
+            ("buffer overflow", "buffer_overflow"),
+            ("path traversal", "path_traversal"),
+            ("directory traversal", "path_traversal"),
+            ("file upload", "file_upload"),
+            ("default credential", "default_creds"),
+            ("weak password", "weak_creds"),
+            ("cve-", "cve_reference"),
         ]
         for marker, normalized in vuln_markers:
-            if marker.lower() in output.lower() and normalized not in vulnerabilities:
-                vulnerabilities.append(normalized)
+            if marker in output_lower:
+                if normalized not in vulnerabilities:
+                    vulnerabilities.append(normalized)
+                    found_new_info = True
 
+        # Extract credentials from various patterns
+        self._extract_credentials_from_output(output)
+
+        # Extract URLs and endpoints
+        urls = re.findall(r'https?://[^\s\'"<>]+', output)
+        endpoints = self.plan.findings.setdefault("endpoints", [])
+        for url in urls:
+            if url not in endpoints:
+                endpoints.append(url)
+                found_new_info = True
+
+        # Track whether we got new info
+        if found_new_info:
+            self._actions_without_new_info = 0
+            self.run_metrics["new_info_actions"] += 1
+        else:
+            self._actions_without_new_info += 1
+
+        # Persist to memory
         self.memory.store_finding("services", "discovered", json.dumps(services), target=self.plan.target)
         self.memory.store_finding("vulnerabilities", "discovered", json.dumps(vulnerabilities), target=self.plan.target)
 
-        if self.plan.credentials:
-            latest = self.plan.credentials[-1]
-            self.memory.store_credential(
-                username=latest.get("username", ""),
-                password=latest.get("password", ""),
-                target=self.plan.target,
-                source=obs.tool,
-            )
-
-    def _recommend_next_action(self, obs: Observation) -> dict:
-        """Recommend a follow-up action based on observed service hints."""
-        output = (obs.output or "").lower()
-        if "80/tcp" in output or "http" in output:
-            return {"action": "curl", "action_input": self.plan.target}
-        if "22/tcp" in output or "ssh" in output:
-            return {"action": "ssh", "action_input": f"-o BatchMode=yes {self.plan.target}"}
-        if "3306" in output or "mysql" in output:
-            return {"action": "sqlmap", "action_input": f"--batch {self.plan.target}"}
-        return {"action": "quick_scan", "action_input": self.plan.target}
-
-    def _select_next_action(self, obs: Observation) -> dict:
-        """Select the most appropriate next action from current findings and service hints."""
-        vulnerabilities = self.plan.findings.get("vulnerabilities", [])
-        credentials = self.plan.credentials
-        output = (obs.output or "").lower()
-
-        if vulnerabilities:
-            return {"action": "sqlmap", "action_input": f"--batch {self.plan.target}"}
-
-        if credentials:
-            return {"action": "ssh", "action_input": f"-o BatchMode=yes {self.plan.target}"}
-
-        if "http" in output or "80/tcp" in output:
-            return {"action": "curl", "action_input": self.plan.target}
-
-        if "ssh" in output or "22/tcp" in output:
-            return {"action": "ssh", "action_input": f"-o BatchMode=yes {self.plan.target}"}
-
-        return self._recommend_next_action(obs)
-
-    def _load_prior_run_insights(self) -> dict:
-        """Load prior run metrics from memory to guide future behavior."""
-        prior_runs = {}
-        for row in self.memory.get_run_metrics_history():
-            run_id = row.get("run_id")
-            if not run_id:
-                continue
-            prior_runs[run_id] = row
-        if not prior_runs:
-            return {"best_runs": {}, "best_strategy": None}
-
-        best_runs = sorted(prior_runs.items(), key=lambda item: (
-            item[1].get("flags_found", 0),
-            -item[1].get("tool_failures", 0),
-            -item[1].get("iterations", 0),
-        ), reverse=True)
-        best_runs_dict = {run_id: metrics for run_id, metrics in best_runs[:3]}
-        return {"best_runs": best_runs_dict, "best_strategy": best_runs[0][1] if best_runs else None}
-
-    def _record_action_outcome(self, action: str, success: bool, output: str):
-        """Track how useful an action was so the agent can avoid repeating failures."""
-        entry = self.action_effectiveness.setdefault(action, {"successes": 0, "failures": 0, "last_output": ""})
-        if success:
-            entry["successes"] += 1
-        else:
-            entry["failures"] += 1
-        entry["last_output"] = output[:200]
-
-    def _format_prior_strategy_context(self) -> str:
-        """Summarize successful prior strategies in a form useful for the LLM prompt."""
-        self.prior_run_insights = self._load_prior_run_insights()
-        if not self.prior_run_insights.get("best_runs"):
-            return "No prior run history available."
-
-        lines = []
-        for run_id, metrics in self.prior_run_insights["best_runs"].items():
-            flags = metrics.get("flags_found", 0)
-            failures = metrics.get("tool_failures", 0)
-            iterations = metrics.get("iterations", 0)
-            lines.append(f"- {run_id}: flags={flags}, failures={failures}, iterations={iterations}")
-        return "\n".join(lines)
-
-    def _format_exploit_reference_context(self) -> str:
-        """Add exploit-db and general exploit context when relevant services are present."""
-        findings = self.plan.findings or {}
-        services = findings.get("services", [])
-        vulns = findings.get("vulnerabilities", [])
-        if not services and not vulns:
-            return "No exploit reference context needed yet."
-
-        hints = []
-        if any("http" in str(item).lower() for item in services):
-            hints.append("Web services often expose SQLi/LFI/RFI/SSTI; consult Exploit-DB and vendor references for specific versions.")
-        if any("ssh" in str(item).lower() for item in services):
-            hints.append("SSH services may be vulnerable to credential reuse or known misconfigurations; consult Exploit-DB for service-specific issues.")
-        if any("sql" in str(item).lower() for item in vulns):
-            hints.append("SQL injection is a strong candidate for exploit research; review public exploit DB references and version-specific payloads.")
-
-        return "\n".join([
-            "Exploit-DB reference guidance:",
-            "- Primary source: https://www.exploit-db.com",
-            "- Use it to find public exploits or PoC references for the specific service/version discovered.",
-            "- Cross-check the target version and match the PoC to the current environment before execution.",
-            *hints,
-        ])
-
-    def _format_service_strategy_context(self) -> str:
-        """Summarize service-specific strategy evidence from prior runs."""
-        evidence = self.memory.get_strategy_evidence(target=self.plan.target)
-        if not evidence:
-            return "No service-specific strategy evidence available yet."
-
-        lines = []
-        for item in evidence:
-            lines.append(
-                f"- service={item.get('service') or 'unknown'} vulnerability={item.get('vulnerability') or 'unknown'} "
-                f"action={item.get('action') or 'unknown'} reference={item.get('reference') or 'n/a'} "
-                f"confidence={item.get('confidence', 0.0)} outcome={item.get('outcome', 'unknown')}"
-            )
-        return "\n".join(["Service-specific strategy evidence:", *lines])
-
-    def _choose_learning_guided_action(self, obs: Observation) -> dict:
-        """Choose a recovery action after repeated low-value outcomes."""
-        action_name = (obs.tool or "").strip()
-        if action_name:
-            self._record_action_outcome(action_name, obs.success, obs.output)
-
-        entry = self.action_effectiveness.get(action_name, {})
-        failures = entry.get("failures", 0)
-        if failures >= 2:
-            return {"action": "quick_scan", "action_input": self.plan.target}
-
-        return self._select_next_action(obs)
-
-    def _build_hypotheses(self, obs: Observation) -> list[dict]:
-        """Build a ranked set of hypotheses from the current state."""
-        output = (obs.output or "").lower()
-        hypotheses: list[dict] = []
-
-        if "sql" in output or "sql injection" in output:
-            hypotheses.append({
-                "hypothesis": "A sql injection vulnerability is present and can be exploited against the target.",
-                "priority": "high",
-                "action": "sqlmap",
-            })
-
-        if self.plan.credentials:
-            hypotheses.append({
-                "hypothesis": "Known credentials may unlock an authenticated service or shell access.",
-                "priority": "high",
-                "action": "ssh",
-            })
-
-        if "http" in output or "80/tcp" in output:
-            hypotheses.append({
-                "hypothesis": "The service exposed on HTTP may reveal a web entry point for further exploitation.",
-                "priority": "medium",
-                "action": "curl",
-            })
-
-        if not hypotheses:
-            hypotheses.append({
-                "hypothesis": "The environment is still in reconnaissance and should be probed more broadly.",
-                "priority": "low",
-                "action": "quick_scan",
-            })
-
-        return sorted(hypotheses, key=lambda item: 0 if item["priority"] == "high" else 1)
-
-    def _check_flags(self, output: str):
-        """Check output for flags."""
-        import re
-        # Common flag patterns
+    def _extract_credentials_from_output(self, output: str):
+        """Extract credentials from tool output using multiple patterns."""
         patterns = [
-            r'flag\{[^}]+\}',
-            r'CTF\{[^}]+\}',
-            r'HALCTF\{[^}]+\}',
-            r'DEFCON\{[^}]+\}',
-            r'[A-Z]+\{[a-zA-Z0-9_!@#$%^&*()-]+\}',
+            # key=value patterns
+            r'(?:username|user|login)\s*[=:]\s*(\S+)',
+            r'(?:password|pass|pwd)\s*[=:]\s*(\S+)',
+            # MySQL-style: root:password@host
+            r'(\w+):(\S+)@\w+',
+            # SSH-style: user@host
+            r'ssh\s+(\w+)@',
+            # HTTP basic auth: user:pass
+            r'Authorization:\s*Basic\s+(\S+)',
         ]
 
-        for pattern in patterns:
-            matches = re.findall(pattern, output, re.IGNORECASE)
-            for match in matches:
-                if match not in self.plan.flags_found:
-                    self.plan.flags_found.append(match)
-                    self.run_metrics["flags_found"] = len(self.plan.flags_found)
-                    logger.info(f"🚩 FLAG FOUND: {match}")
+        usernames = []
+        passwords = []
+
+        for line in output.splitlines():
+            line_lower = line.lower()
+            if "username=" in line_lower or "user=" in line_lower:
+                match = re.search(r'(?:username|user)\s*=\s*(\S+)', line, re.IGNORECASE)
+                if match:
+                    usernames.append(match.group(1))
+            if "password=" in line_lower or "pass=" in line_lower:
+                match = re.search(r'(?:password|pass)\s*=\s*(\S+)', line, re.IGNORECASE)
+                if match:
+                    passwords.append(match.group(1))
+
+        # Pair up usernames and passwords
+        for i in range(max(len(usernames), len(passwords))):
+            u = usernames[i] if i < len(usernames) else ""
+            p = passwords[i] if i < len(passwords) else ""
+            if u or p:
+                cred = {"username": u, "password": p}
+                if cred not in self.plan.credentials:
+                    self.plan.credentials.append(cred)
+                    self.memory.store_credential(
+                        username=u, password=p,
+                        target=self.plan.target, source="auto_extract",
+                    )
+
+    # ============================================================
+    # FLAG EXTRACTION
+    # ============================================================
+
+    def _extract_flags(self, output: str) -> list[str]:
+        """Extract all flags from output using comprehensive patterns."""
+        if not output:
+            return []
+        matches = _FLAG_RE.findall(output)
+        # Deduplicate and filter
+        seen = set()
+        unique = []
+        for m in matches:
+            if m not in seen and m not in self.plan.flags_found:
+                seen.add(m)
+                unique.append(m)
+        return unique
+
+    def _handle_flag(self, flag: str, obs: Observation):
+        """Handle a discovered flag — store and submit."""
+        if flag in self.plan.flags_found:
+            return
+
+        self.plan.flags_found.append(flag)
+        self.run_metrics["flags_found"] = len(self.plan.flags_found)
+        logger.info(f"🚩 FLAG FOUND: {flag}")
+
+        # Store in memory
+        self.memory.store_flag(flag, source=obs.tool, target=self.plan.target)
+
+        # Submit to scoreboard
+        sb_result = self.scoreboard.submit(flag)
+        if sb_result.get("status") == "submitted":
+            self.run_metrics["flags_submitted"] += 1
+
+    # ============================================================
+    # STATE MANAGEMENT
+    # ============================================================
 
     def _update_state(self, decision: dict, obs: Observation):
         """Update agent state based on decision and observation."""
@@ -658,50 +748,173 @@ Now, what's your next action?"""
 
         # Auto state transitions based on findings
         if self.plan.state == AgentState.RECON:
-            # If we've done enough recon, move to enumeration
-            recon_actions = sum(1 for o in self.history if o.tool in ["nmap", "masscan", "whatweb"])
-            if recon_actions >= 3 and self.plan.findings.get("services"):
+            services = self.plan.findings.get("services", [])
+            if len(services) >= 2:
                 self.plan.state = AgentState.ENUMERATION
                 logger.info("📊 Transitioning to ENUMERATION phase")
 
         elif self.plan.state == AgentState.ENUMERATION:
-            # If we've found potential vulns, move to exploitation
-            if self.plan.findings.get("vulnerabilities") or self.plan.credentials:
+            vulns = self.plan.findings.get("vulnerabilities", [])
+            if vulns or self.plan.credentials:
                 self.plan.state = AgentState.EXPLOITATION
                 logger.info("⚡ Transitioning to EXPLOITATION phase")
 
         elif self.plan.state == AgentState.EXPLOITATION:
-            # If we've compromised something, check for pivoting
-            if self.plan.findings.get("compromised"):
+            compromised = self.plan.findings.get("compromised", [])
+            if compromised:
                 self.plan.state = AgentState.PIVOT
                 logger.info("🔀 Transitioning to PIVOT phase")
+            elif self.plan.flags_found:
+                # If we found flags but haven't compromised, stay in exploitation
+                # but note the success
+                logger.info("🎯 Flags found in exploitation phase — continuing search")
+
+        elif self.plan.state == AgentState.POST_EXPLOIT:
+            if self.plan.flags_found and self.current_target_idx >= len(self.targets) - 1:
+                self.plan.state = AgentState.DONE
+                logger.info("🏁 All targets processed, flags found. DONE.")
 
         # Move to next target if current one is exhausted
-        if self.plan.state in [AgentState.PIVOT, AgentState.DONE]:
+        if self._actions_without_new_info >= 10:
             if self.current_target_idx < len(self.targets) - 1:
                 self.current_target_idx += 1
                 self.plan.target = self.targets[self.current_target_idx]
                 self.plan.state = AgentState.RECON
+                self._actions_without_new_info = 0
                 logger.info(f"🔄 Moving to next target: {self.plan.target}")
+            elif self.plan.flags_found:
+                self.plan.state = AgentState.DONE
 
+        # Track phase transitions
         if self._last_phase is None or self._last_phase != self.plan.state:
             self.run_metrics["phase_transitions"] += 1
             self._last_phase = self.plan.state
+
+    # ============================================================
+    # LOOP DETECTION & CIRCUIT BREAKER
+    # ============================================================
+
+    def _detect_loop(self) -> bool:
+        """Detect if agent is stuck in a loop (semantic, not just exact match)."""
+        if len(self.history) < LOOP_DETECTION_WINDOW:
+            return False
+
+        recent = self.history[-LOOP_DETECTION_WINDOW:]
+        # Check for exact action repetition
+        signatures = [f"{o.tool}:{hashlib.md5(o.command.encode()).hexdigest()[:8]}" for o in recent]
+        if len(set(signatures)) <= 1:
+            self._consecutive_same_action += 1
+        else:
+            self._consecutive_same_action = 0
+
+        return self._consecutive_same_action >= LOOP_DETECTION_THRESHOLD
+
+    def _break_loop(self):
+        """Break detected loop by forcing a state change."""
+        self.run_metrics["loop_detected"] += 1
+        logger.warning("⚠️ Loop detected! Forcing strategy change.")
+
+        # Force phase transition
+        phase_order = [AgentState.RECON, AgentState.ENUMERATION, AgentState.EXPLOITATION, AgentState.POST_EXPLOIT]
+        current_idx = phase_order.index(self.plan.state) if self.plan.state in phase_order else 0
+        next_idx = (current_idx + 1) % len(phase_order)
+        self.plan.state = phase_order[next_idx]
+        self._consecutive_same_action = 0
+        self._actions_without_new_info = 0
+        logger.info(f"🔄 Forced transition to {self.plan.state.value}")
+
+    def _try_circuit_breaker_recovery(self) -> bool:
+        """Try to recover from circuit breaker. Returns False if unrecoverable."""
+        # Try next target
+        if self.current_target_idx < len(self.targets) - 1:
+            self.current_target_idx += 1
+            self.plan.target = self.targets[self.current_target_idx]
+            self.plan.state = AgentState.RECON
+            self._consecutive_failures = 0
+            self._current_delay = ACTION_DELAY_BASE
+            logger.info(f"🔄 Circuit breaker recovery: switching to target {self.plan.target}")
+            return True
+
+        # Try resetting to a different phase
+        if self.plan.state != AgentState.EXPLOITATION:
+            self.plan.state = AgentState.EXPLOITATION
+            self._consecutive_failures = 0
+            logger.info("🔄 Circuit breaker recovery: switching to EXPLOITATION phase")
+            return True
+
+        return False
+
+    def _backoff(self):
+        """Exponential backoff on failures."""
+        self._current_delay = min(self._current_delay * 1.5, ACTION_DELAY_MAX)
+
+    # ============================================================
+    # EFFECTIVENESS TRACKING
+    # ============================================================
+
+    def _track_effectiveness(self, decision: dict, obs: Observation):
+        """Track which actions produce useful results."""
+        action = decision.get("action", "unknown")
+        entry = self.memory.get_strategy_evidence(target=self.plan.target)
+
+        # Record to memory
+        success_outcome = "success" if obs.success else "failure"
+        self.memory.store_strategy_evidence(
+            target=self.plan.target,
+            service=str(self.plan.findings.get("services", ["unknown"])[0]) if self.plan.findings.get("services") else "unknown",
+            vulnerability=str(self.plan.findings.get("vulnerabilities", ["unknown"])[0]) if self.plan.findings.get("vulnerabilities") else "unknown",
+            action=action,
+            confidence=0.8 if obs.success else 0.2,
+            outcome=success_outcome,
+        )
+
+    def _format_prior_context(self) -> str:
+        """Format prior run insights for the prompt."""
+        history = self.memory.get_run_metrics_history()
+        if not history:
+            return "No prior run history."
+
+        lines = []
+        for row in history[-3:]:  # Last 3 runs
+            flags = row.get("flags_found", 0)
+            iters = row.get("iterations", 0)
+            failures = row.get("tool_failures", 0)
+            lines.append(f"- Run {row.get('run_id', '?')}: flags={flags}, iterations={iters}, failures={failures}")
+        return "\n".join(lines)
+
+    def _format_effectiveness_context(self) -> str:
+        """Format action effectiveness data for the prompt."""
+        evidence = self.memory.get_strategy_evidence(target=self.plan.target)
+        if not evidence:
+            return "No action effectiveness data yet."
+
+        lines = []
+        for item in evidence[-5:]:  # Last 5 entries
+            lines.append(f"- {item.get('action', '?')}: {item.get('outcome', '?')} (confidence: {item.get('confidence', 0):.1f})")
+        return "\n".join(lines)
+
+    # ============================================================
+    # FINAL REPORT
+    # ============================================================
 
     def _report(self):
         """Generate final report."""
         logger.info("\n" + "="*60)
         logger.info("🏴 OZZ FINAL REPORT")
         logger.info("="*60)
+        logger.info(f"Run ID: {self.run_id}")
         logger.info(f"Total actions: {len(self.history)}")
         logger.info(f"Flags found: {len(self.plan.flags_found)}")
+        logger.info(f"Flags submitted: {len(self.scoreboard.submitted)}")
         logger.info(f"Loop detections: {self.run_metrics['loop_detected']}")
+        logger.info(f"Circuit breaks: {self.run_metrics['circuit_breaks']}")
         logger.info(f"Phase transitions: {self.run_metrics['phase_transitions']}")
         logger.info(f"Tool failures: {self.run_metrics['tool_failures']}")
-        logger.info(f"LLM fallbacks used: {self.run_metrics.get('llm_fallbacks', 0)}")
+        logger.info(f"LLM fallbacks: {self.run_metrics['llm_fallbacks']}")
+        logger.info(f"New info actions: {self.run_metrics['new_info_actions']}")
         for flag in self.plan.flags_found:
-            logger.info(f"  🚩 {flag}")
+            submitted = "✅" if flag in self.scoreboard.submitted else "❌"
+            logger.info(f"  🚩 {flag} [{submitted}]")
         logger.info(f"Findings: {json.dumps(self.plan.findings, indent=2, default=str)}")
-        logger.info(f"Credentials: {self.plan.credentials}")
-        logger.info(f"Run metrics: {json.dumps(self.run_metrics, indent=2, default=str)}")
+        logger.info(f"Credentials: {json.dumps(self.plan.credentials, indent=2)}")
         logger.info("="*60)

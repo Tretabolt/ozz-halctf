@@ -118,8 +118,11 @@ def main():
     # Get model path
     model_path = os.environ.get("MODEL_PATH", "/models")
 
+    # Get scoreboard URL
+    scoreboard_url = os.environ.get("SCOREBOARD_URL", "")
+
     # Create and run agent
-    agent = OzzAgent(targets=targets, model_path=model_path)
+    agent = OzzAgent(targets=targets, model_path=model_path, scoreboard_url=scoreboard_url)
     logger.info("Starting autonomous run with observability enabled.")
     agent.run()
 
